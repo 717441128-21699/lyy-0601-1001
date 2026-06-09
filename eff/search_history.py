@@ -119,6 +119,18 @@ def get_popular_keywords(search_type=None, limit=10):
     return rows
 
 
+def get_search_by_id(search_id):
+    """根据ID获取搜索记录"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM search_history WHERE id = ?', (search_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    return row
+
+
 def clear_search_history(search_type=None, days=None):
     """清除搜索历史"""
     conn = get_connection()

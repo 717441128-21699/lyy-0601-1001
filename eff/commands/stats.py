@@ -92,9 +92,11 @@ def get_time_stats_by_range(start_date, end_date):
         stats['total_pomodoros'] += row['cnt']
     
     cursor.execute('''
-    SELECT * FROM pomodoros 
-    WHERE DATE(start_time) BETWEEN ? AND ? AND status = 'completed'
-    ORDER BY start_time
+    SELECT p.*, t.title as task_title
+    FROM pomodoros p
+    LEFT JOIN tasks t ON p.task_id = t.id
+    WHERE DATE(p.start_time) BETWEEN ? AND ? AND p.status = 'completed'
+    ORDER BY p.start_time
     ''', (start_date.isoformat(), end_date.isoformat()))
     stats['pomodoros'] = cursor.fetchall()
     
@@ -283,6 +285,39 @@ def generate_stats_report(stats, metrics, fmt='txt'):
                 lines.append(f"  {tag}: {data['total']}个任务, {format_duration(data['focus'])}专注, 完成率{rate:.1f}%")
             lines.append("")
         
+        if stats['tasks']:
+            lines.append("📋 任务列表")
+            lines.append(f"  {'ID':<5} {'状态':<8} {'优先级':<6} {'标题'}")
+            lines.append(f"  {'-'*5} {'-'*8} {'-'*6} {'-'*40}")
+            for task in stats['tasks']:
+                p_label = {4: '🔴', 3: '🟠', 2: '🟡', 1: '🟢'}[task['priority']]
+                s_label = {'pending': '待办', 'in_progress': '进行中', 'completed': '完成', 'cancelled': '取消'}[task['status']]
+                title = task['title'][:40] + '...' if len(task['title']) > 40 else task['title']
+                lines.append(f"  {task['id']:<5} {s_label:<8} {p_label:<6} {title}")
+            lines.append("")
+        
+        if stats['pomodoros']:
+            lines.append("🍅 番茄钟记录")
+            lines.append(f"  {'ID':<5} {'时长':<8} {'干扰':<6} {'任务'}")
+            lines.append(f"  {'-'*5} {'-'*8} {'-'*6} {'-'*40}")
+            for pomo in stats['pomodoros']:
+                task_title = pomo.get('task_title') or '无关联任务'
+                task_title = task_title[:40] + '...' if len(task_title) > 40 else task_title
+                inter = pomo['interruptions'] or 0
+                lines.append(f"  {pomo['id']:<5} {format_duration(pomo['duration']):<8} {inter:<6} {task_title}")
+            lines.append("")
+        
+        if stats['notes']:
+            lines.append("📝 笔记摘要")
+            lines.append(f"  {'ID':<5} {'分类':<8} {'内容摘要'}")
+            lines.append(f"  {'-'*5} {'-'*8} {'-'*50}")
+            for note in stats['notes']:
+                category = note['category'] or '普通'
+                content = note['content'][:50] + '...' if len(note['content']) > 50 else note['content']
+                content = content.replace('\n', ' ')
+                lines.append(f"  {note['id']:<5} {category:<8} {content}")
+            lines.append("")
+        
         return '\n'.join(lines)
 
 
@@ -344,7 +379,9 @@ def overview(range_type, start, end, export_fmt, output):
     time_stats = get_time_stats_by_range(start_date, end_date)
     metrics = get_efficiency_metrics(start_date, end_date)
     
-    if time_stats['total_tasks'] == 0 and time_stats['total_pomodoros'] == 0:
+    if (time_stats['total_tasks'] == 0 and 
+        time_stats['total_pomodoros'] == 0 and 
+        len(time_stats['notes']) == 0):
         console.print(Panel(
             f"[dim]{range_label}没有统计数据[/dim]\n\n"
             "开始使用 eff 添加任务和番茄钟后，这里会显示统计信息",

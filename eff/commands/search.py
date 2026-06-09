@@ -8,11 +8,78 @@ from rich.prompt import Confirm
 from ..database import get_connection
 from ..search_history import (
     get_search_history, get_popular_keywords, 
-    get_last_search, clear_search_history
+    get_last_search, clear_search_history, get_search_by_id, record_search
 )
 from ..utils import format_datetime
 
 console = Console()
+
+
+def _execute_task_search(keyword):
+    """执行任务搜索"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT t.*,
+           (SELECT COUNT(*) FROM tasks WHERE parent_id = t.id) as subtask_count
+    FROM tasks t
+    WHERE t.title LIKE ? OR t.description LIKE ? OR t.tags LIKE ?
+    ORDER BY t.priority DESC, t.created_at DESC
+    ''', (f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'))
+    
+    tasks = cursor.fetchall()
+    conn.close()
+    
+    record_search(keyword, 'task', len(tasks))
+    
+    if not tasks:
+        console.print(Panel(
+            f"[dim]没有找到包含 '{keyword}' 的任务[/dim]\n\n"
+            "试试其他关键词，或使用 [cyan]eff task list[/cyan] 查看所有任务",
+            title="🔍 任务搜索结果", border_style="dim"
+        ))
+    else:
+        console.print(f"[dim]找到 {len(tasks)} 个匹配的任务[/dim]")
+        from .task import display_tasks
+        display_tasks(tasks)
+
+
+def _execute_note_search(keyword):
+    """执行笔记搜索"""
+    from .note import search_notes
+    
+    notes = search_notes(keyword)
+    record_search(keyword, 'note', len(notes))
+    
+    if not notes:
+        console.print(Panel(
+            f"[dim]没有找到包含 '{keyword}' 的笔记[/dim]\n\n"
+            "试试其他关键词，或使用 [cyan]eff note list[/cyan] 查看所有笔记",
+            title="🔍 笔记搜索结果", border_style="dim"
+        ))
+    else:
+        console.print(f"[dim]找到 {len(notes)} 条匹配的笔记[/dim]")
+        from .note import _display_search_results
+        _display_search_results(notes)
+
+
+def run_search(record):
+    """根据搜索记录执行搜索"""
+    if not record:
+        console.print("[red]✗ 没有找到搜索记录[/red]")
+        return
+    
+    keyword = record['keyword']
+    search_type = record['search_type']
+    type_label = {'task': '任务', 'note': '笔记'}[search_type]
+    
+    console.print(f"\n[cyan]正在重新搜索 {type_label}: {keyword}[/cyan]\n")
+    
+    if search_type == 'task':
+        _execute_task_search(keyword)
+    elif search_type == 'note':
+        _execute_note_search(keyword)
 
 
 @click.group()
@@ -30,8 +97,17 @@ def search():
               default='recent', help='排序方式：recent(最近) / popular(最多用)')
 @click.option('-k', '--keyword', help='按关键词过滤')
 @click.option('-n', '--limit', type=int, default=20, help='显示数量限制')
-def history(search_type, sort_by, keyword, limit):
+@click.option('-r', '--run', 'run_id', type=int, help='通过ID直接运行搜索')
+def history(search_type, sort_by, keyword, limit, run_id):
     """查看搜索历史"""
+    if run_id is not None:
+        record = get_search_by_id(run_id)
+        if not record:
+            console.print(f"[red]✗ 搜索记录 ID {run_id} 不存在[/red]")
+            return
+        run_search(record)
+        return
+    
     st = None if search_type == 'all' else search_type
     records = get_search_history(st, sort_by, keyword, limit)
     
@@ -39,7 +115,8 @@ def history(search_type, sort_by, keyword, limit):
         type_label = '所有' if search_type == 'all' else search_type
         console.print(Panel(
             f"[dim]没有{type_label}搜索历史记录[/dim]\n\n"
-            "使用 [cyan]eff task search[/cyan] 或 [cyan]eff note search[/cyan] 开始搜索",
+            "使用 [cyan]eff task search[/cyan] 或 [cyan]eff note search[/cyan] 开始搜索\n"
+            "使用 [cyan]eff search history -r <ID>[/cyan] 直接复用历史搜索",
             title="🔍 搜索历史", border_style="dim"
         ))
         return
@@ -84,6 +161,9 @@ def history(search_type, sort_by, keyword, limit):
     
     console.print(f"[bold]🔍 {type_label}{sort_label}历史[/bold]\n")
     console.print(table)
+    
+    if sort_by == 'recent':
+        console.print(f"\n[dim]💡 使用 [cyan]eff search history -r <ID>[/cyan] 直接复用搜索[/dim]")
 
 
 @search.command()
@@ -131,7 +211,8 @@ def popular(search_type, limit):
 @click.option('-t', '--type', 'search_type', 
               type=click.Choice(['task', 'note', 'all']), 
               default='all', help='搜索类型')
-def last(search_type):
+@click.option('-r', '--run', is_flag=True, help='直接运行最近一次搜索')
+def last(search_type, run):
     """查看最近一次搜索"""
     st = None if search_type == 'all' else search_type
     last = get_last_search(st)
@@ -146,10 +227,15 @@ def last(search_type):
     
     type_label = {'task': '任务', 'note': '笔记'}.get(last['search_type'], last['search_type'])
     
+    if run:
+        run_search(last)
+        return
+    
     console.print(f"[bold]🔍 最近一次{type_label}搜索[/bold]\n")
     console.print(f"  关键词: [cyan]{last['keyword']}[/cyan]")
     console.print(f"  命中数: {last['hit_count']}")
     console.print(f"  搜索时间: {format_datetime(datetime.fromisoformat(last['created_at']))}")
+    console.print(f"\n[dim]💡 使用 [cyan]eff search last -r[/cyan] 直接重新搜索[/dim]")
 
 
 @search.command()

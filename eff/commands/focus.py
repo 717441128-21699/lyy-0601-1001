@@ -2,6 +2,7 @@ import click
 import time
 import sys
 import threading
+import select
 from datetime import datetime, date, timedelta
 from rich.console import Console
 from rich.table import Table
@@ -12,7 +13,7 @@ from rich.layout import Layout
 from rich.text import Text
 
 from ..database import get_connection
-from ..utils import format_duration, format_datetime, parse_date
+from ..utils import format_duration, format_datetime, format_date, parse_date
 from ..config import get_config_value
 
 console = Console()
@@ -115,7 +116,7 @@ class PomodoroSession:
         conn.close()
     
     def complete(self):
-        actual_duration = self.duration - (self.total_paused_seconds // 60)
+        actual_duration = (self.total_seconds - self.remaining_seconds) // 60
         actual_duration = max(1, actual_duration)
         
         end_time = datetime.now()
@@ -305,6 +306,20 @@ def run_interactive_session(session):
         timer = threading.Thread(target=timer_thread, daemon=True)
         timer.start()
         
+        input_queue = []
+        
+        def input_thread():
+            while session.status in ('running', 'paused'):
+                try:
+                    cmd = sys.stdin.readline().strip()
+                    if cmd is not None:
+                        input_queue.append(cmd)
+                except:
+                    break
+        
+        input_t = threading.Thread(target=input_thread, daemon=True)
+        input_t.start()
+        
         try:
             while session.status in ('running', 'paused'):
                 layout["header"].update(display_header())
@@ -316,8 +331,8 @@ def run_interactive_session(session):
                     messages.append((f"🎉 番茄钟完成！实际专注 {format_duration(actual)}", "green"))
                     break
                 
-                try:
-                    cmd = click.prompt("", prompt_suffix="> ", default="", show_default=False)
+                if input_queue:
+                    cmd = input_queue.pop(0)
                     if cmd == '':
                         continue
                         
@@ -336,17 +351,17 @@ def run_interactive_session(session):
                     
                     if not continue_run:
                         break
+                else:
+                    time.sleep(0.1)
                         
-                except EOFError:
-                    break
-                except KeyboardInterrupt:
-                    session.pause()
-                    session.status = 'paused'
-                    messages.append(("检测到中断，已暂停。输入 r 恢复，q 结束", "yellow"))
-                    layout["messages"].update(Panel(
-                        "\n".join([f"[{s}] {m}" for m, s in messages[-5:]]), 
-                        title="消息", border_style="dim"
-                    ))
+        except KeyboardInterrupt:
+            session.pause()
+            session.status = 'paused'
+            messages.append(("检测到中断，已暂停。输入 r 恢复，q 结束", "yellow"))
+            layout["messages"].update(Panel(
+                "\n".join([f"[{s}] {m}" for m, s in messages[-5:]]), 
+                title="消息", border_style="dim"
+            ))
                     
         finally:
             session._stop_event.set()
@@ -355,10 +370,13 @@ def run_interactive_session(session):
     console.clear()
     
     if session.status == 'completed':
+        actual = (session.total_seconds - session.remaining_seconds) // 60
+        actual = max(1, actual)
         console.print(Panel(
             f"[bold green]🎉 番茄钟完成！[/bold green]\n\n"
             f"计划时长: {format_duration(session.duration)}\n"
-            f"实际专注: {format_duration(session.total_seconds // 60)}\n"
+            f"实际专注: {format_duration(actual)}\n"
+            f"暂停时间: {format_duration(session.total_paused_seconds // 60)}\n"
             f"干扰次数: {session.interruptions}\n"
             f"任务: {session.task_title or '无关联任务'}",
             title="专注完成", border_style="green"
