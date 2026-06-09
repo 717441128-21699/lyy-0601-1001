@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eff-cli"
+version = "1.0.0"
+description = "个人效率命令行工具 - 为键盘用户设计的任务、番茄钟和笔记管理工具"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Eff User"}]
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.7.0",
+    "python-dateutil>=2.8.2",
+]
+
+[project.scripts]
+eff = "eff.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eff*"]
