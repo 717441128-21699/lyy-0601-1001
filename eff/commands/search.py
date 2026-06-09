@@ -316,3 +316,124 @@ def clear(search_type, days):
             console.print(f"[green]✓ 已清除 {deleted} 条搜索记录[/green]")
         else:
             console.print(f"[yellow]没有可清除的搜索记录[/yellow]")
+
+
+@search.command()
+@click.argument('search_id', type=int)
+@click.argument('name')
+def save(search_id, name):
+    """将搜索历史保存为常用搜索"""
+    from ..saved_searches import save_search
+    
+    record = get_search_by_id(search_id)
+    if not record:
+        console.print(f"[red]✗ 搜索记录 ID {search_id} 不存在[/red]")
+        return
+    
+    keyword = record['keyword']
+    search_type = record['search_type']
+    filters = record.get('filters')
+    
+    success, msg = save_search(name, search_type, keyword, filters)
+    
+    if success:
+        type_label = {'task': '任务', 'note': '笔记'}[search_type]
+        console.print(f"[green]✓ 已保存为常用搜索: [cyan]{name}[/cyan] ({type_label})[/green]")
+        console.print(f"  关键词: {keyword or '无'}")
+        if filters:
+            console.print(f"  筛选条件: {filters}")
+    else:
+        console.print(f"[red]✗ {msg}[/red]")
+
+
+@search.command()
+@click.argument('name')
+def run(name):
+    """运行常用搜索（短命令）"""
+    from ..saved_searches import get_saved_search, run_saved_search
+    
+    saved = get_saved_search(name)
+    if not saved:
+        console.print(f"[red]✗ 常用搜索 '{name}' 不存在[/red]")
+        console.print(f"[dim]使用 [cyan]eff search saved[/cyan] 查看所有常用搜索[/dim]")
+        return
+    
+    type_label = {'task': '任务', 'note': '笔记'}[saved['search_type']]
+    keyword = saved['keyword']
+    filters = saved.get('filters', {})
+    
+    filter_parts = []
+    if filters:
+        for k, v in filters.items():
+            k_label = {'tag': '标签', 'status': '状态', 'category': '分类', 'start_date': '开始', 'end_date': '结束'}[k]
+            filter_parts.append(f"{k_label}: {v}")
+    
+    filter_str = f" (筛选: {', '.join(filter_parts)})" if filter_parts else ""
+    
+    console.print(f"\n[cyan]运行常用搜索: {name} ({type_label})[/cyan]")
+    console.print(f"  关键词: {keyword or '无'}{filter_str}\n")
+    
+    run_search(saved)
+
+
+@search.command('saved')
+def list_saved():
+    """列出所有常用搜索"""
+    from ..saved_searches import list_saved_searches
+    
+    saved = list_saved_searches()
+    
+    if not saved:
+        console.print(Panel(
+            "[dim]还没有常用搜索[/dim]\n\n"
+            "使用 [cyan]eff search save <ID> <名称>[/cyan] 保存常用搜索",
+            title="⭐ 常用搜索", border_style="dim"
+        ))
+        return
+    
+    table = Table(show_header=True, header_style="bold yellow")
+    table.add_column("名称", width=20)
+    table.add_column("类型", width=8)
+    table.add_column("关键词", overflow="fold")
+    table.add_column("筛选条件", overflow="fold")
+    table.add_column("上次使用", width=20)
+    
+    for s in saved:
+        type_label = {'task': '任务', 'note': '笔记'}[s['search_type']]
+        filters = s.get('filters')
+        
+        filter_desc = '-'
+        if filters:
+            filter_parts = []
+            for k, v in filters.items():
+                k_label = {'tag': '标签', 'status': '状态', 'category': '分类', 'start_date': '开始', 'end_date': '结束'}[k]
+                filter_parts.append(f"{k_label}: {v}")
+            filter_desc = ', '.join(filter_parts)
+        
+        last_used = format_datetime(datetime.fromisoformat(s['last_used_at'])) if s['last_used_at'] else '未使用'
+        
+        table.add_row(
+            s['name'],
+            type_label,
+            s['keyword'] or '-',
+            filter_desc,
+            last_used
+        )
+    
+    console.print(f"[bold]⭐ 常用搜索 ({len(saved)} 个)[/bold]\n")
+    console.print(table)
+    console.print(f"\n[dim]💡 使用 [cyan]eff search run <名称>[/cyan] 快速运行[/dim]")
+
+
+@search.command('delete-saved')
+@click.argument('name')
+def delete_saved(name):
+    """删除常用搜索"""
+    from ..saved_searches import delete_saved_search
+    
+    if Confirm.ask(f"确定要删除常用搜索 '{name}' 吗？"):
+        deleted = delete_saved_search(name)
+        if deleted:
+            console.print(f"[green]✓ 已删除常用搜索: {name}[/green]")
+        else:
+            console.print(f"[yellow]常用搜索 '{name}' 不存在[/yellow]")

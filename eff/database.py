@@ -105,11 +105,27 @@ def init_db():
         pass
     
     cursor.execute('''
+    CREATE TABLE IF NOT EXISTS saved_searches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        search_type TEXT NOT NULL,
+        keyword TEXT,
+        filters TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_used_at DATETIME
+    )
+    ''')
+    
+    cursor.execute('''
     CREATE INDEX IF NOT EXISTS idx_search_history_keyword ON search_history(keyword)
     ''')
     
     cursor.execute('''
     CREATE INDEX IF NOT EXISTS idx_search_history_type ON search_history(search_type)
+    ''')
+    
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_saved_searches_name ON saved_searches(name)
     ''')
     
     conn.commit()

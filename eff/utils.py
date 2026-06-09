@@ -84,6 +84,19 @@ def get_week_range(date_obj=None):
     return start, end
 
 
+def get_month_range(date_obj=None):
+    if date_obj is None:
+        date_obj = date.today()
+    
+    start = date_obj.replace(day=1)
+    if start.month == 12:
+        next_month = start.replace(year=start.year + 1, month=1, day=1)
+    else:
+        next_month = start.replace(month=start.month + 1, day=1)
+    end = next_month - timedelta(days=1)
+    return start, end
+
+
 def is_overdue(due_date, status='pending'):
     if not due_date or status == 'completed':
         return False

@@ -108,6 +108,34 @@ def _execute_note_search(keyword, tag=None, category=None, start_date=None, end_
     return notes, filters
 
 
+def _display_search_results(notes):
+    """统一展示笔记搜索结果（稳定展示，不会中断）"""
+    if not notes:
+        return
+    
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("ID", style="dim", width=6)
+    table.add_column("分类", width=10)
+    table.add_column("标签", width=15)
+    table.add_column("内容", overflow="fold")
+    table.add_column("创建时间", width=20)
+    
+    for note in notes:
+        content = note['content']
+        if len(content) > 80:
+            content = content[:77] + '...'
+        
+        table.add_row(
+            str(note['id']),
+            note['category'] or '普通',
+            note['tags'] or '-',
+            content,
+            format_datetime(datetime.fromisoformat(note['created_at']))
+        )
+    
+    console.print(table)
+
+
 def delete_note(note_id):
     conn = get_connection()
     cursor = conn.cursor()

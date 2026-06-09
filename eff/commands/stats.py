@@ -170,96 +170,104 @@ def get_efficiency_metrics(start_date, end_date):
     return metrics
 
 
-def generate_stats_report(stats, metrics, fmt='txt'):
-    """生成统计报告"""
+def generate_stats_report(stats, metrics, fmt='txt', include=None, filter_tag=None):
+    """生成统计报告
+    
+    Args:
+        stats: 统计数据
+        metrics: 效率指标
+        fmt: 导出格式 (txt/markdown/json)
+        include: 指定导出的数据类型列表，None 表示全部
+        filter_tag: 按标签过滤任务和笔记
+    """
+    def row_get(row, key, default=None):
+        try:
+            val = row[key]
+            return val if val is not None else default
+        except (KeyError, IndexError):
+            return default
+    
     start_date = stats['start_date']
     end_date = stats['end_date']
     range_label = f"{format_date(start_date)} 至 {format_date(end_date)}"
     
+    include = include or ['tasks', 'pomodoros', 'notes']
+    
+    filtered_tasks = stats['tasks']
+    filtered_notes = stats['notes']
+    
+    if filter_tag:
+        filtered_tasks = [t for t in stats['tasks'] if t['tags'] and filter_tag in t['tags'].split(',')]
+        filtered_notes = [n for n in stats['notes'] if n['tags'] and filter_tag in n['tags'].split(',')]
+    
     if fmt == 'json':
         report = {
+            'export_time': datetime.now().isoformat(),
+            'version': '1.0',
             'meta': {
-                'report_type': 'stats',
-                'generated_at': datetime.now().isoformat(),
+                'report_type': 'stats_archive',
                 'range': {
                     'start_date': start_date.isoformat(),
                     'end_date': end_date.isoformat(),
                     'label': range_label
+                },
+                'filters': {
+                    'include': list(include),
+                    'filter_tag': filter_tag
                 }
             },
             'overview': {
-                'total_tasks': stats['total_tasks'],
-                'completed_tasks': stats['completed_tasks'],
-                'incomplete_tasks': stats['incomplete_tasks'],
-                'completion_rate': round(stats['completion_rate'], 1),
-                'total_pomodoros': stats['total_pomodoros'],
-                'total_focus_minutes': stats['total_focus'],
-                'avg_focus_per_day_minutes': int(stats['avg_focus_per_day']),
-                'estimation_accuracy': round(metrics['estimation_accuracy'], 1),
-                'avg_completion_time_minutes': int(metrics['avg_completion_time'])
+                'total_tasks': len(filtered_tasks) if 'tasks' in include else 0,
+                'completed_tasks': sum(1 for t in filtered_tasks if t['status'] == 'completed') if 'tasks' in include else 0,
+                'total_pomodoros': stats['total_pomodoros'] if 'pomodoros' in include else 0,
+                'total_focus_minutes': stats['total_focus'] if 'pomodoros' in include else 0,
             },
-            'by_priority': {},
-            'by_tag': {},
             'tasks': [],
             'pomodoros': [],
             'notes': []
         }
         
-        for priority, data in stats['by_priority'].items():
-            p_label = {4: '紧急', 3: '高', 2: '中', 1: '低'}[priority]
-            rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
-            report['by_priority'][p_label] = {
-                'total': data['total'],
-                'completed': data['completed'],
-                'completion_rate': round(rate, 1)
-            }
+        if 'tasks' in include:
+            for task in filtered_tasks:
+                report['tasks'].append({
+                    'id': task['id'],
+                    'title': task['title'],
+                    'description': task['description'],
+                    'priority': task['priority'],
+                    'due_date': task['due_date'],
+                    'tags': task['tags'],
+                    'status': task['status'],
+                    'parent_id': row_get(task, 'parent_id'),
+                    'estimated_time': task['estimated_time'],
+                    'actual_time': row_get(task, 'actual_time', 0),
+                    'created_at': task['created_at'],
+                    'completed_at': task['completed_at']
+                })
         
-        for tag, data in stats['by_tag'].items():
-            rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
-            report['by_tag'][tag] = {
-                'total': data['total'],
-                'completed': data['completed'],
-                'completion_rate': round(rate, 1),
-                'focus_minutes': data['focus']
-            }
+        if 'pomodoros' in include:
+            for pomo in stats['pomodoros']:
+                report['pomodoros'].append({
+                    'id': pomo['id'],
+                    'task_id': pomo['task_id'],
+                    'start_time': pomo['start_time'],
+                    'end_time': row_get(pomo, 'end_time'),
+                    'duration': pomo['duration'],
+                    'status': row_get(pomo, 'status', 'completed'),
+                    'interruptions': row_get(pomo, 'interruptions', 0),
+                    'interruption_notes': row_get(pomo, 'interruption_notes')
+                })
         
-        for task in stats['tasks']:
-            report['tasks'].append({
-                'id': task['id'],
-                'title': task['title'],
-                'description': task['description'],
-                'priority': {4: '紧急', 3: '高', 2: '中', 1: '低'}[task['priority']],
-                'status': {'pending': '待办', 'in_progress': '进行中', 'completed': '完成', 'cancelled': '取消'}[task['status']],
-                'tags': task['tags'].split(',') if task['tags'] else [],
-                'due_date': task['due_date'],
-                'estimated_time': task['estimated_time'],
-                'actual_time': task['actual_time'],
-                'created_at': task['created_at'],
-                'completed_at': task['completed_at']
-            })
-        
-        for pomo in stats['pomodoros']:
-            report['pomodoros'].append({
-                'id': pomo['id'],
-                'task_id': pomo['task_id'],
-                'task_title': pomo.get('task_title'),
-                'duration_minutes': pomo['duration'],
-                'interruptions': pomo['interruptions'] or 0,
-                'interruption_notes': pomo['interruption_notes'],
-                'start_time': pomo['start_time'],
-                'end_time': pomo['end_time']
-            })
-        
-        for note in stats['notes']:
-            report['notes'].append({
-                'id': note['id'],
-                'content': note['content'],
-                'category': note['category'] or '普通',
-                'tags': note['tags'].split(',') if note['tags'] else [],
-                'template_name': note['template_name'],
-                'created_at': note['created_at'],
-                'updated_at': note['updated_at']
-            })
+        if 'notes' in include:
+            for note in filtered_notes:
+                report['notes'].append({
+                    'id': note['id'],
+                    'content': note['content'],
+                    'category': row_get(note, 'category'),
+                    'tags': row_get(note, 'tags'),
+                    'template_name': row_get(note, 'template_name'),
+                    'created_at': note['created_at'],
+                    'updated_at': row_get(note, 'updated_at', row_get(note, 'created_at'))
+                })
         
         return json.dumps(report, ensure_ascii=False, indent=2)
     
@@ -271,17 +279,21 @@ def generate_stats_report(stats, metrics, fmt='txt'):
         lines.append("")
         lines.append("| 指标 | 数值 |")
         lines.append("|------|------|")
-        lines.append(f"| 新增任务 | {stats['total_tasks']} 个 |")
-        lines.append(f"| 完成任务 | {stats['completed_tasks']} 个 |")
+        lines.append(f"| 新增任务 | {len(filtered_tasks) if 'tasks' in include else 0} 个 |")
+        lines.append(f"| 完成任务 | {sum(1 for t in filtered_tasks if t['status'] == 'completed') if 'tasks' in include else 0} 个 |")
         lines.append(f"| 完成率 | {stats['completion_rate']:.1f}% |")
         lines.append(f"| 进行中 | {stats['incomplete_tasks']} 个 |")
-        lines.append(f"| 番茄钟 | {stats['total_pomodoros']} 个 |")
-        lines.append(f"| 总专注时长 | {format_duration(stats['total_focus'])} |")
-        lines.append(f"| 日均专注 | {format_duration(int(stats['avg_focus_per_day']))} |")
+        lines.append(f"| 番茄钟 | {stats['total_pomodoros'] if 'pomodoros' in include else 0} 个 |")
+        lines.append(f"| 总专注时长 | {format_duration(stats['total_focus'] if 'pomodoros' in include else 0)} |")
+        lines.append(f"| 日均专注 | {format_duration(int(stats['avg_focus_per_day'] if 'pomodoros' in include else 0))} |")
         lines.append(f"| 预估准确度 | {metrics['estimation_accuracy']:.1f}% |")
         lines.append("")
         
-        if stats['by_priority']:
+        if filter_tag:
+            lines.append(f"> **过滤标签**: {filter_tag}")
+            lines.append("")
+        
+        if stats['by_priority'] and 'tasks' in include:
             lines.append("## 🎯 按优先级统计")
             lines.append("")
             lines.append("| 优先级 | 总数 | 已完成 | 完成率 |")
@@ -293,7 +305,7 @@ def generate_stats_report(stats, metrics, fmt='txt'):
                 lines.append(f"| {p_label} | {data['total']} | {data['completed']} | {rate:.1f}% |")
             lines.append("")
         
-        if stats['by_tag']:
+        if stats['by_tag'] and 'tasks' in include:
             lines.append("## 🏷️  按标签统计")
             lines.append("")
             lines.append("| 标签 | 任务数 | 已完成 | 完成率 | 专注时长 |")
@@ -303,12 +315,12 @@ def generate_stats_report(stats, metrics, fmt='txt'):
                 lines.append(f"| {tag} | {data['total']} | {data['completed']} | {rate:.1f}% | {format_duration(data['focus'])} |")
             lines.append("")
         
-        if stats['tasks']:
+        if filtered_tasks and 'tasks' in include:
             lines.append("## 📋 任务列表")
             lines.append("")
             lines.append("| ID | 标题 | 优先级 | 状态 | 创建时间 | 完成时间 |")
             lines.append("|----|------|--------|------|----------|----------|")
-            for task in stats['tasks']:
+            for task in filtered_tasks:
                 p_label = {4: '🔴 紧急', 3: '🟠 高', 2: '🟡 中', 1: '🟢 低'}[task['priority']]
                 s_label = {'pending': '⏳ 待办', 'in_progress': '🔄 进行中', 'completed': '✅ 完成', 'cancelled': '❌ 取消'}[task['status']]
                 created_at = task['created_at'][:16].replace('T', ' ')
@@ -316,24 +328,25 @@ def generate_stats_report(stats, metrics, fmt='txt'):
                 lines.append(f"| {task['id']} | {task['title']} | {p_label} | {s_label} | {created_at} | {completed_at} |")
             lines.append("")
         
-        if stats['pomodoros']:
+        if stats['pomodoros'] and 'pomodoros' in include:
             lines.append("## 🍅 番茄钟记录")
             lines.append("")
-            lines.append("| ID | 任务 | 时长 | 干扰 | 开始时间 |")
-            lines.append("|----|------|------|------|----------|")
+            lines.append("| ID | 任务 | 时长 | 干扰次数 | 开始时间 |")
+            lines.append("|----|------|------|----------|----------|")
             for pomo in stats['pomodoros']:
-                task_title = pomo.get('task_title') or '无关联任务'
+                task_title = row_get(pomo, 'task_title') or '无关联任务'
                 start_time = pomo['start_time'][:16].replace('T', ' ')
                 inter = pomo['interruptions'] or 0
-                lines.append(f"| {pomo['id']} | {task_title} | {format_duration(pomo['duration'])} | {inter} | {start_time} |")
+                duration = format_duration(pomo['duration'])
+                lines.append(f"| {pomo['id']} | {task_title} | {duration} | {inter} | {start_time} |")
             lines.append("")
         
-        if stats['notes']:
+        if filtered_notes and 'notes' in include:
             lines.append("## 📝 笔记摘要")
             lines.append("")
             lines.append("| ID | 分类 | 内容摘要 | 创建时间 |")
             lines.append("|----|------|----------|----------|")
-            for note in stats['notes']:
+            for note in filtered_notes:
                 content = note['content'][:50].replace('|', '\\|') + '...' if len(note['content']) > 50 else note['content'].replace('|', '\\|')
                 category = note['category'] or '普通'
                 created_at = note['created_at'][:16].replace('T', ' ')
@@ -347,17 +360,21 @@ def generate_stats_report(stats, metrics, fmt='txt'):
         lines.append(f"=== 统计报告 - {range_label} ===")
         lines.append("")
         lines.append("📈 概览统计")
-        lines.append(f"  新增任务: {stats['total_tasks']} 个")
-        lines.append(f"  完成任务: {stats['completed_tasks']} 个")
+        lines.append(f"  新增任务: {len(filtered_tasks) if 'tasks' in include else 0} 个")
+        lines.append(f"  完成任务: {sum(1 for t in filtered_tasks if t['status'] == 'completed') if 'tasks' in include else 0} 个")
         lines.append(f"  完成率: {stats['completion_rate']:.1f}%")
         lines.append(f"  进行中: {stats['incomplete_tasks']} 个")
-        lines.append(f"  番茄钟: {stats['total_pomodoros']} 个")
-        lines.append(f"  总专注时长: {format_duration(stats['total_focus'])}")
-        lines.append(f"  日均专注: {format_duration(int(stats['avg_focus_per_day']))}")
+        lines.append(f"  番茄钟: {stats['total_pomodoros'] if 'pomodoros' in include else 0} 个")
+        lines.append(f"  总专注时长: {format_duration(stats['total_focus'] if 'pomodoros' in include else 0)}")
+        lines.append(f"  日均专注: {format_duration(int(stats['avg_focus_per_day'] if 'pomodoros' in include else 0))}")
         lines.append(f"  预估准确度: {metrics['estimation_accuracy']:.1f}%")
         lines.append("")
         
-        if stats['by_priority']:
+        if filter_tag:
+            lines.append(f"🔍 过滤标签: {filter_tag}")
+            lines.append("")
+        
+        if stats['by_priority'] and 'tasks' in include:
             lines.append("🎯 按优先级统计")
             for priority in sorted(stats['by_priority'].keys(), reverse=True):
                 data = stats['by_priority'][priority]
@@ -366,40 +383,42 @@ def generate_stats_report(stats, metrics, fmt='txt'):
                 lines.append(f"  {p_label}: {data['total']}个任务, {data['completed']}个完成, 完成率{rate:.1f}%")
             lines.append("")
         
-        if stats['by_tag']:
+        if stats['by_tag'] and 'tasks' in include:
             lines.append("🏷️  按标签统计 (Top 10)")
             for tag, data in sorted(stats['by_tag'].items(), key=lambda x: -x[1]['total'])[:10]:
                 rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
                 lines.append(f"  {tag}: {data['total']}个任务, {format_duration(data['focus'])}专注, 完成率{rate:.1f}%")
             lines.append("")
         
-        if stats['tasks']:
+        if filtered_tasks and 'tasks' in include:
             lines.append("📋 任务列表")
             lines.append(f"  {'ID':<5} {'状态':<8} {'优先级':<6} {'标题'}")
             lines.append(f"  {'-'*5} {'-'*8} {'-'*6} {'-'*40}")
-            for task in stats['tasks']:
+            for task in filtered_tasks:
                 p_label = {4: '🔴', 3: '🟠', 2: '🟡', 1: '🟢'}[task['priority']]
                 s_label = {'pending': '待办', 'in_progress': '进行中', 'completed': '完成', 'cancelled': '取消'}[task['status']]
                 title = task['title'][:40] + '...' if len(task['title']) > 40 else task['title']
                 lines.append(f"  {task['id']:<5} {s_label:<8} {p_label:<6} {title}")
             lines.append("")
         
-        if stats['pomodoros']:
+        if stats['pomodoros'] and 'pomodoros' in include:
             lines.append("🍅 番茄钟记录")
-            lines.append(f"  {'ID':<5} {'时长':<8} {'干扰':<6} {'任务'}")
-            lines.append(f"  {'-'*5} {'-'*8} {'-'*6} {'-'*40}")
+            lines.append(f"  {'ID':<5} {'时长':<8} {'干扰次数':<10} {'开始时间':<20} {'任务'}")
+            lines.append(f"  {'-'*5} {'-'*8} {'-'*10} {'-'*20} {'-'*30}")
             for pomo in stats['pomodoros']:
-                task_title = pomo.get('task_title') or '无关联任务'
-                task_title = task_title[:40] + '...' if len(task_title) > 40 else task_title
+                task_title = row_get(pomo, 'task_title') or '无关联任务'
+                task_title = task_title[:30] + '...' if len(task_title) > 30 else task_title
                 inter = pomo['interruptions'] or 0
-                lines.append(f"  {pomo['id']:<5} {format_duration(pomo['duration']):<8} {inter:<6} {task_title}")
+                start_time = pomo['start_time'][:16].replace('T', ' ')
+                duration = format_duration(pomo['duration'])
+                lines.append(f"  {pomo['id']:<5} {duration:<8} {inter:<10} {start_time:<20} {task_title}")
             lines.append("")
         
-        if stats['notes']:
+        if filtered_notes and 'notes' in include:
             lines.append("📝 笔记摘要")
             lines.append(f"  {'ID':<5} {'分类':<8} {'内容摘要'}")
             lines.append(f"  {'-'*5} {'-'*8} {'-'*50}")
-            for note in stats['notes']:
+            for note in filtered_notes:
                 category = note['category'] or '普通'
                 content = note['content'][:50] + '...' if len(note['content']) > 50 else note['content']
                 content = content.replace('\n', ' ')
@@ -447,6 +466,10 @@ def add_export_options(f):
                      type=click.Choice(['txt', 'markdown', 'json']),
                      help='导出报告格式')(f)
     f = click.option('-o', '--output', help='导出文件名（可选）')(f)
+    f = click.option('--include', multiple=True,
+                     type=click.Choice(['tasks', 'pomodoros', 'notes']),
+                     help='指定导出的数据类型（可多选），默认全部导出')(f)
+    f = click.option('--filter-tag', help='按标签过滤任务和笔记')(f)
     return f
 
 
@@ -459,7 +482,7 @@ def stats():
 @stats.command()
 @add_date_range_options
 @add_export_options
-def overview(range_type, start, end, export_fmt, output):
+def overview(range_type, start, end, export_fmt, output, include, filter_tag):
     """总体统计概览"""
     start_date, end_date = get_date_range(range_type, start, end)
     range_label = get_range_label(range_type, start_date, end_date)
@@ -467,38 +490,240 @@ def overview(range_type, start, end, export_fmt, output):
     time_stats = get_time_stats_by_range(start_date, end_date)
     metrics = get_efficiency_metrics(start_date, end_date)
     
-    if (time_stats['total_tasks'] == 0 and 
-        time_stats['total_pomodoros'] == 0 and 
-        len(time_stats['notes']) == 0):
-        if not export_fmt:
-            console.print(Panel(
-                f"[dim]{range_label}没有统计数据[/dim]\n\n"
-                "开始使用 eff 添加任务和番茄钟后，这里会显示统计信息",
-                title=f"📊 {range_label}统计概览", border_style="dim"
-            ))
-            return
+    has_data = (time_stats['total_tasks'] > 0 or 
+                time_stats['total_pomodoros'] > 0 or 
+                len(time_stats['notes']) > 0)
     
-    console.print(Panel.fit(
-        f"[bold]📊 {range_label}统计概览[/bold]\n\n"
-        f"📋 任务统计\n"
-        f"  新增任务: {time_stats['total_tasks']} 个\n"
-        f"  完成任务: {time_stats['completed_tasks']} 个\n"
-        f"  完成率: {time_stats['completion_rate']:.1f}%  \n"
-        f"  进行中: {time_stats['incomplete_tasks']} 个\n\n"
-        f"🍅 专注统计\n"
-        f"  番茄钟: {time_stats['total_pomodoros']} 个\n"
-        f"  总专注时长: {format_duration(time_stats['total_focus'])}\n"
-        f"  日均专注: {format_duration(int(time_stats['avg_focus_per_day']))}\n\n"
-        f"📈 效率指标\n"
-        f"  平均完成耗时: {format_duration(int(metrics['avg_completion_time']))}\n"
-        f"  预估准确度: {metrics['estimation_accuracy']:.1f}%",
-        title=f"📊 {range_label}统计", border_style="blue"
-    ))
+    if not has_data and not export_fmt:
+        console.print(Panel(
+            f"[dim]{range_label}没有统计数据[/dim]\n\n"
+            "开始使用 eff 添加任务和番茄钟后，这里会显示统计信息",
+            title=f"📊 {range_label}统计概览", border_style="dim"
+        ))
+        return
+    
+    if has_data:
+        console.print(Panel.fit(
+            f"[bold]📊 {range_label}统计概览[/bold]\n\n"
+            f"📋 任务统计\n"
+            f"  新增任务: {time_stats['total_tasks']} 个\n"
+            f"  完成任务: {time_stats['completed_tasks']} 个\n"
+            f"  完成率: {time_stats['completion_rate']:.1f}%  \n"
+            f"  进行中: {time_stats['incomplete_tasks']} 个\n\n"
+            f"🍅 专注统计\n"
+            f"  番茄钟: {time_stats['total_pomodoros']} 个\n"
+            f"  总专注时长: {format_duration(time_stats['total_focus'])}\n"
+            f"  日均专注: {format_duration(int(time_stats['avg_focus_per_day']))}\n\n"
+            f"📈 效率指标\n"
+            f"  平均完成耗时: {format_duration(int(metrics['avg_completion_time']))}\n"
+            f"  预估准确度: {metrics['estimation_accuracy']:.1f}%",
+            title=f"📊 {range_label}统计", border_style="blue"
+        ))
+    elif export_fmt:
+        console.print(f"[dim]📊 {range_label}没有数据，但将生成空报告用于归档[/dim]")
     
     if export_fmt:
-        report = generate_stats_report(time_stats, metrics, fmt=export_fmt)
+        include_list = list(include) if include else None
+        report = generate_stats_report(time_stats, metrics, fmt=export_fmt, 
+                                       include=include_list, filter_tag=filter_tag)
         file_path = export_report(report, range_type, start_date, end_date, fmt=export_fmt)
         console.print(f"\n[green]✓ 报告已导出到: {file_path}[/green]")
+
+
+@stats.command()
+@click.option('-p', '--period', 
+              type=click.Choice(['week', 'month']), 
+              default='week', help='归档周期：week(周) / month(月)')
+@click.option('--include', multiple=True,
+              type=click.Choice(['tasks', 'pomodoros', 'notes']),
+              help='指定归档的数据类型（可多选），默认全部')
+@click.option('--filter-tag', help='按标签过滤')
+def archive(period, include, filter_tag):
+    """按周/月生成归档报告（txt + markdown + json + 索引）"""
+    from ..utils import get_week_range, get_month_range
+    
+    today = date.today()
+    if period == 'week':
+        start_date, end_date = get_week_range(today)
+        range_label = f"{format_date(start_date)}_to_{format_date(end_date)}"
+        period_label = "本周"
+    else:
+        start_date, end_date = get_month_range(today)
+        range_label = f"{today.year}_{today.month:02d}"
+        period_label = "本月"
+    
+    time_stats = get_time_stats_by_range(start_date, end_date)
+    metrics = get_efficiency_metrics(start_date, end_date)
+    
+    include_list = list(include) if include else None
+    
+    export_dir = Path(get_config_value('export_dir')).expanduser()
+    archive_dir = export_dir / f"archive_{period}_{range_label}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    
+    formats = ['txt', 'markdown', 'json']
+    exported_files = []
+    
+    for fmt in formats:
+        report = generate_stats_report(time_stats, metrics, fmt=fmt,
+                                       include=include_list, filter_tag=filter_tag)
+        ext = fmt
+        filename = f"stats_{period}_{range_label}.{ext}"
+        file_path = archive_dir / filename
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(report)
+        exported_files.append((fmt, file_path))
+    
+    index_content = []
+    index_content.append(f"# 统计归档 - {period_label}")
+    index_content.append("")
+    index_content.append(f"**时间范围**: {format_date(start_date)} 至 {format_date(end_date)}")
+    index_content.append(f"**生成时间**: {format_datetime(datetime.now())}")
+    index_content.append("")
+    
+    if include_list:
+        index_content.append(f"**数据类型**: {', '.join(include_list)}")
+    else:
+        index_content.append("**数据类型**: 全部")
+    
+    if filter_tag:
+        index_content.append(f"**标签过滤**: {filter_tag}")
+    
+    index_content.append("")
+    index_content.append("## 📁 归档文件")
+    index_content.append("")
+    index_content.append("| 格式 | 文件名 | 大小 |")
+    index_content.append("|------|--------|------|")
+    
+    total_size = 0
+    for fmt, file_path in exported_files:
+        size = file_path.stat().st_size
+        total_size += size
+        index_content.append(f"| {fmt.upper()} | {file_path.name} | {size} B |")
+    
+    index_content.append("")
+    index_content.append(f"**总大小**: {total_size} B")
+    index_content.append("")
+    index_content.append("## 📊 概览统计")
+    index_content.append("")
+    index_content.append(f"- 任务数: {time_stats['total_tasks']}")
+    index_content.append(f"- 完成数: {time_stats['completed_tasks']}")
+    index_content.append(f"- 番茄钟: {time_stats['total_pomodoros']}")
+    index_content.append(f"- 总专注: {format_duration(time_stats['total_focus'])}")
+    index_content.append(f"- 笔记数: {len(time_stats['notes'])}")
+    
+    index_path = archive_dir / "README.md"
+    with open(index_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(index_content))
+    
+    console.print(f"[bold green]✓ 归档完成[/bold green]\n")
+    console.print(f"[bold]📁 归档目录:[/bold] {archive_dir}")
+    console.print(f"[bold]📅 时间范围:[/bold] {format_date(start_date)} 至 {format_date(end_date)}")
+    console.print("")
+    console.print(f"[bold]📄 包含文件:[/bold]")
+    for fmt, file_path in exported_files:
+        size = file_path.stat().st_size
+        console.print(f"  • {fmt.upper():<10} {file_path.name:<40} ({size} B)")
+    console.print(f"  • {'INDEX':<10} README.md")
+    console.print("")
+    console.print(f"[bold]📊 归档内容:[/bold]")
+    console.print(f"  • 任务: {time_stats['total_tasks']} 个 (完成: {time_stats['completed_tasks']} 个)")
+    console.print(f"  • 番茄钟: {time_stats['total_pomodoros']} 个 ({format_duration(time_stats['total_focus'])})")
+    console.print(f"  • 笔记: {len(time_stats['notes'])} 条")
+    
+    return archive_dir
+
+
+@stats.command()
+@click.argument('file_path', type=click.Path(exists=True))
+def validate(file_path):
+    """校验 JSON 导出文件结构，确保能被 sync import 读取"""
+    import json
+    from pathlib import Path
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]✗ JSON 解析失败: {e}[/red]")
+        return
+    except Exception as e:
+        console.print(f"[red]✗ 读取文件失败: {e}[/red]")
+        return
+    
+    errors = []
+    warnings = []
+    
+    required_sections = ['tasks', 'pomodoros', 'notes']
+    for section in required_sections:
+        if section not in data:
+            warnings.append(f"缺少可选字段 '{section}'，将视为空列表")
+    
+    task_required_fields = ['id', 'title']
+    task_optional_fields = ['description', 'priority', 'due_date', 'tags', 'status', 
+                             'parent_id', 'estimated_time', 'actual_time', 'created_at', 'completed_at']
+    
+    pomo_required_fields = ['id', 'start_time', 'duration']
+    pomo_optional_fields = ['task_id', 'end_time', 'status', 'interruptions', 'interruption_notes']
+    
+    note_required_fields = ['id', 'content']
+    note_optional_fields = ['category', 'tags', 'template_name', 'created_at', 'updated_at']
+    
+    def validate_items(items, required_fields, optional_fields, item_name):
+        item_errors = []
+        for i, item in enumerate(items):
+            for field in required_fields:
+                if field not in item:
+                    item_errors.append(f"  {item_name}[{i}] 缺少必填字段: {field}")
+            
+            for key in item:
+                if key not in required_fields and key not in optional_fields:
+                    warnings.append(f"  {item_name}[{i}] 包含未知字段: {key}")
+        
+        return item_errors
+    
+    if 'tasks' in data:
+        if not isinstance(data['tasks'], list):
+            errors.append("'tasks' 必须是列表")
+        else:
+            errors.extend(validate_items(data['tasks'], task_required_fields, task_optional_fields, 'tasks'))
+            console.print(f"  📋 任务: {len(data['tasks'])} 条")
+    
+    if 'pomodoros' in data:
+        if not isinstance(data['pomodoros'], list):
+            errors.append("'pomodoros' 必须是列表")
+        else:
+            errors.extend(validate_items(data['pomodoros'], pomo_required_fields, pomo_optional_fields, 'pomodoros'))
+            console.print(f"  🍅 番茄钟: {len(data['pomodoros'])} 条")
+    
+    if 'notes' in data:
+        if not isinstance(data['notes'], list):
+            errors.append("'notes' 必须是列表")
+        else:
+            errors.extend(validate_items(data['notes'], note_required_fields, note_optional_fields, 'notes'))
+            console.print(f"  📝 笔记: {len(data['notes'])} 条")
+    
+    if 'meta' in data:
+        console.print(f"  📄 元数据: 存在")
+        if 'range' in data['meta']:
+            console.print(f"    时间范围: {data['meta']['range']}")
+    
+    console.print()
+    
+    if warnings:
+        console.print(f"[yellow]⚠️  警告 ({len(warnings)} 条):[/yellow]")
+        for w in warnings:
+            console.print(f"  {w}")
+        console.print()
+    
+    if errors:
+        console.print(f"[red]✗ 校验失败 ({len(errors)} 个错误):[/red]")
+        for e in errors:
+            console.print(f"  {e}")
+        console.print(f"\n[red]此文件无法被 sync import 正确读取[/red]")
+    else:
+        console.print(f"[green]✓ 校验通过！此文件可以被 sync import 正确读取[/green]")
+        console.print(f"\n[dim]使用 [cyan]eff sync import {file_path}[/cyan] 导入数据[/dim]")
 
 
 @stats.command()
