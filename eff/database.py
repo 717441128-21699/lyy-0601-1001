@@ -88,5 +88,23 @@ def init_db():
     )
     ''')
     
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS search_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        keyword TEXT NOT NULL,
+        search_type TEXT NOT NULL,
+        hit_count INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_search_history_keyword ON search_history(keyword)
+    ''')
+    
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_search_history_type ON search_history(search_type)
+    ''')
+    
     conn.commit()
     conn.close()

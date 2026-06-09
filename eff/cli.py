@@ -10,6 +10,7 @@ from .commands.review import review
 from .commands.stats import stats
 from .commands.sync import sync
 from .commands.config import config
+from .commands.search import search
 
 import click
 
@@ -42,6 +43,7 @@ cli.add_command(review)
 cli.add_command(stats)
 cli.add_command(sync)
 cli.add_command(config)
+cli.add_command(search)
 
 
 @cli.command()

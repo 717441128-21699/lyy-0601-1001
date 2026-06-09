@@ -1,12 +1,15 @@
 import click
 import time
 import sys
-import signal
+import threading
 from datetime import datetime, date, timedelta
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
 from rich.panel import Panel
+from rich.live import Live
+from rich.layout import Layout
+from rich.text import Text
 
 from ..database import get_connection
 from ..utils import format_duration, format_datetime, parse_date
@@ -14,121 +17,382 @@ from ..config import get_config_value
 
 console = Console()
 
-PAUSED_POMODORO_ID = None
+
+class PomodoroSession:
+    def __init__(self, task_id=None, duration=None):
+        self.task_id = task_id
+        self.task_title = None
+        self.duration = duration or get_config_value('pomodoro_duration')
+        self.total_seconds = self.duration * 60
+        self.remaining_seconds = self.total_seconds
+        self.pomodoro_id = None
+        self.status = 'idle'
+        self.interruptions = 0
+        self.interruption_notes = []
+        self.start_time = None
+        self.pause_time = None
+        self.total_paused_seconds = 0
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._command = None
+        
+    def validate_task(self):
+        if self.task_id is None:
+            return True
+        
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM tasks WHERE id = ?', (self.task_id,))
+        task = cursor.fetchone()
+        conn.close()
+        
+        if not task:
+            return False
+        
+        self.task_title = task['title']
+        return True
+    
+    def create_pomodoro_record(self):
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        INSERT INTO pomodoros (task_id, start_time, duration, status)
+        VALUES (?, CURRENT_TIMESTAMP, ?, 'running')
+        ''', (self.task_id, self.duration))
+        
+        self.pomodoro_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        self.start_time = datetime.now()
+        return True
+    
+    def update_pomodoro_status(self, status, end_time=None):
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        updates = []
+        params = []
+        
+        updates.append('status = ?')
+        params.append(status)
+        
+        if end_time:
+            updates.append('end_time = ?')
+            params.append(end_time.isoformat())
+        
+        if self.interruptions > 0:
+            updates.append('interruptions = ?')
+            params.append(self.interruptions)
+        
+        if self.interruption_notes:
+            updates.append('interruption_notes = ?')
+            params.append('\n'.join(self.interruption_notes))
+        
+        params.append(self.pomodoro_id)
+        query = f"UPDATE pomodoros SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, params)
+        
+        conn.commit()
+        conn.close()
+    
+    def add_interruption(self, note=None):
+        self.interruptions += 1
+        timestamp = datetime.now().strftime('%H:%M')
+        note_text = note or '未记录原因'
+        self.interruption_notes.append(f"- {timestamp}: {note_text}")
+        
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        UPDATE pomodoros 
+        SET interruptions = COALESCE(interruptions, 0) + 1,
+            interruption_notes = COALESCE(interruption_notes, '') || ?
+        WHERE id = ?
+        ''', (f"\n- {timestamp}: {note_text}", self.pomodoro_id))
+        conn.commit()
+        conn.close()
+    
+    def complete(self):
+        actual_duration = self.duration - (self.total_paused_seconds // 60)
+        actual_duration = max(1, actual_duration)
+        
+        end_time = datetime.now()
+        self.update_pomodoro_status('completed', end_time)
+        
+        if self.task_id:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+            UPDATE tasks 
+            SET actual_time = COALESCE(actual_time, 0) + ?,
+                status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END
+            WHERE id = ?
+            ''', (actual_duration, self.task_id))
+            conn.commit()
+            conn.close()
+        
+        return actual_duration
+    
+    def cancel(self):
+        actual_duration = (self.total_seconds - self.remaining_seconds) // 60
+        actual_duration = max(1, actual_duration)
+        
+        end_time = datetime.now()
+        self.update_pomodoro_status('cancelled', end_time)
+        
+        if self.task_id and actual_duration > 0:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+            UPDATE tasks 
+            SET actual_time = COALESCE(actual_time, 0) + ?
+            WHERE id = ?
+            ''', (actual_duration, self.task_id))
+            conn.commit()
+            conn.close()
+        
+        return actual_duration
+    
+    def pause(self):
+        self.pause_time = datetime.now()
+        self._pause_event.set()
+        self.update_pomodoro_status('paused')
+    
+    def resume(self):
+        if self.pause_time:
+            paused_seconds = (datetime.now() - self.pause_time).total_seconds()
+            self.total_paused_seconds += int(paused_seconds)
+            self.pause_time = None
+        self._pause_event.clear()
+        self.update_pomodoro_status('running')
+    
+    def get_status_text(self):
+        if self.status == 'running':
+            return Text("🏃 运行中", style="green")
+        elif self.status == 'paused':
+            return Text("⏸️  已暂停", style="yellow")
+        elif self.status == 'completed':
+            return Text("✅ 已完成", style="green")
+        elif self.status == 'cancelled':
+            return Text("❌ 已取消", style="red")
+        return Text("⏳ 等待中", style="dim")
+    
+    def get_progress_info(self):
+        elapsed = self.total_seconds - self.remaining_seconds
+        progress = elapsed / self.total_seconds * 100 if self.total_seconds > 0 else 0
+        return elapsed, self.remaining_seconds, progress
+
+
+def run_interactive_session(session):
+    console.clear()
+    
+    def display_header():
+        header = Panel(
+            f"[bold]🍅 番茄钟专注会话[/bold]\n\n"
+            f"[cyan]任务:[/cyan] {session.task_title or '无关联任务'}\n"
+            f"[cyan]状态:[/cyan] {session.get_status_text()}\n"
+            f"[cyan]计划时长:[/cyan] {format_duration(session.duration)}\n"
+            f"[cyan]干扰次数:[/cyan] {session.interruptions}",
+            title=f"番茄钟 #{session.pomodoro_id}",
+            border_style="magenta"
+        )
+        return header
+    
+    def display_controls():
+        controls = Text()
+        controls.append("⌨️  控制命令: ", style="bold")
+        controls.append("p", style="yellow")
+        controls.append("暂停 ")
+        controls.append("r", style="green")
+        controls.append("恢复 ")
+        controls.append("i", style="cyan")
+        controls.append("记录干扰 ")
+        controls.append("q", style="red")
+        controls.append("提前结束 ")
+        controls.append("?", style="dim")
+        controls.append("帮助")
+        return controls
+    
+    def display_progress():
+        elapsed, remaining, progress = session.get_progress_info()
+        bar_length = 40
+        filled = int(progress / 100 * bar_length)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        
+        progress_text = Text()
+        progress_text.append(f"{bar} ", style="magenta")
+        progress_text.append(f"{progress:5.1f}%  ", style="bold")
+        progress_text.append(f"⏱️  剩余: {format_duration(remaining // 60)}", style="cyan")
+        return progress_text
+    
+    def handle_command(cmd):
+        cmd = cmd.strip().lower()
+        
+        if cmd == 'p' and session.status == 'running':
+            session.pause()
+            session.status = 'paused'
+            return True, "已暂停"
+            
+        elif cmd == 'r' and session.status == 'paused':
+            session.resume()
+            session.status = 'running'
+            return True, "已恢复"
+            
+        elif cmd == 'i':
+            note = click.prompt("请输入干扰原因（直接回车跳过）", default="", show_default=False)
+            session.add_interruption(note if note else None)
+            return True, f"已记录干扰 #{session.interruptions}"
+            
+        elif cmd == 'q':
+            if click.confirm("确定要提前结束吗？将记录已专注的时间"):
+                actual = session.cancel()
+                session.status = 'cancelled'
+                return False, f"已结束，实际专注 {format_duration(actual)}"
+            return True, "继续专注"
+            
+        elif cmd == '?':
+            return True, "\n".join([
+                "p      - 暂停当前番茄钟",
+                "r      - 恢复暂停的番茄钟",
+                "i      - 记录一次干扰",
+                "q      - 提前结束，记录已专注时间",
+                "?      - 显示此帮助信息",
+                "<回车> - 刷新显示"
+            ])
+            
+        elif cmd == '':
+            return True, None
+            
+        else:
+            return True, f"未知命令: {cmd}，输入 ? 查看帮助"
+    
+    layout = Layout()
+    layout.split(
+        Layout(name="header", size=8),
+        Layout(name="progress", size=3),
+        Layout(name="controls", size=2),
+        Layout(name="messages", size=10)
+    )
+    
+    messages = []
+    
+    session.status = 'running'
+    messages.append(("🍅 番茄钟开始！", "green"))
+    
+    with Live(layout, refresh_per_second=4, screen=True):
+        layout["header"].update(display_header())
+        layout["progress"].update(display_progress())
+        layout["controls"].update(display_controls())
+        layout["messages"].update(Panel("\n".join([f"[{s}] {m}" for m, s in messages[-5:]]), 
+                                          title="消息", border_style="dim"))
+        
+        def timer_thread():
+            while not session._stop_event.is_set() and session.remaining_seconds > 0:
+                if not session._pause_event.is_set() and session.status == 'running':
+                    time.sleep(0.5)
+                    session.remaining_seconds -= 0.5
+                    if session.remaining_seconds <= 0:
+                        session.remaining_seconds = 0
+                        break
+                else:
+                    time.sleep(0.1)
+            
+            if session.remaining_seconds <= 0 and session.status == 'running':
+                session._command = '_complete'
+        
+        timer = threading.Thread(target=timer_thread, daemon=True)
+        timer.start()
+        
+        try:
+            while session.status in ('running', 'paused'):
+                layout["header"].update(display_header())
+                layout["progress"].update(display_progress())
+                
+                if session._command == '_complete':
+                    actual = session.complete()
+                    session.status = 'completed'
+                    messages.append((f"🎉 番茄钟完成！实际专注 {format_duration(actual)}", "green"))
+                    break
+                
+                try:
+                    cmd = click.prompt("", prompt_suffix="> ", default="", show_default=False)
+                    if cmd == '':
+                        continue
+                        
+                    continue_run, msg = handle_command(cmd)
+                    if msg:
+                        style = "yellow" if "暂停" in msg or "未知" in msg else "cyan"
+                        if "已完成" in msg or "已结束" in msg:
+                            style = "green"
+                        if "已取消" in msg:
+                            style = "red"
+                        messages.append((msg, style))
+                        layout["messages"].update(Panel(
+                            "\n".join([f"[{s}] {m}" for m, s in messages[-5:]]), 
+                            title="消息", border_style="dim"
+                        ))
+                    
+                    if not continue_run:
+                        break
+                        
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    session.pause()
+                    session.status = 'paused'
+                    messages.append(("检测到中断，已暂停。输入 r 恢复，q 结束", "yellow"))
+                    layout["messages"].update(Panel(
+                        "\n".join([f"[{s}] {m}" for m, s in messages[-5:]]), 
+                        title="消息", border_style="dim"
+                    ))
+                    
+        finally:
+            session._stop_event.set()
+            timer.join(timeout=1)
+    
+    console.clear()
+    
+    if session.status == 'completed':
+        console.print(Panel(
+            f"[bold green]🎉 番茄钟完成！[/bold green]\n\n"
+            f"计划时长: {format_duration(session.duration)}\n"
+            f"实际专注: {format_duration(session.total_seconds // 60)}\n"
+            f"干扰次数: {session.interruptions}\n"
+            f"任务: {session.task_title or '无关联任务'}",
+            title="专注完成", border_style="green"
+        ))
+        
+        short_break = get_config_value('short_break_duration')
+        console.print(f"\n☕ 休息 {short_break} 分钟吧！")
+        
+    elif session.status == 'cancelled':
+        actual = (session.total_seconds - session.remaining_seconds) // 60
+        console.print(Panel(
+            f"[bold yellow]⏹️  番茄钟已提前结束[/bold yellow]\n\n"
+            f"已专注: {format_duration(max(1, actual))}\n"
+            f"干扰次数: {session.interruptions}\n"
+            f"任务: {session.task_title or '无关联任务'}",
+            title="提前结束", border_style="yellow"
+        ))
+    
+    return session.status
 
 
 def start_pomodoro(task_id=None, duration=None):
-    if duration is None:
-        duration = get_config_value('pomodoro_duration')
+    session = PomodoroSession(task_id, duration)
     
-    conn = get_connection()
-    cursor = conn.cursor()
+    if task_id is not None:
+        if not session.validate_task():
+            console.print(f"[red]✗ 任务 ID {task_id} 不存在，请检查后重试[/red]")
+            return None
     
-    cursor.execute('''
-    INSERT INTO pomodoros (task_id, start_time, duration, status)
-    VALUES (?, CURRENT_TIMESTAMP, ?, 'running')
-    ''', (task_id, duration))
+    if not session.create_pomodoro_record():
+        console.print("[red]✗ 创建番茄钟记录失败[/red]")
+        return None
     
-    pomodoro_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    return pomodoro_id, duration
-
-
-def pause_pomodoro(pomodoro_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    UPDATE pomodoros 
-    SET status = 'paused', end_time = CURRENT_TIMESTAMP
-    WHERE id = ? AND status = 'running'
-    ''', (pomodoro_id,))
-    
-    conn.commit()
-    updated = cursor.rowcount > 0
-    conn.close()
-    
-    return updated
-
-
-def resume_pomodoro(pomodoro_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM pomodoros WHERE id = ?', (pomodoro_id,))
-    pomo = cursor.fetchone()
-    
-    if not pomo or pomo['status'] != 'paused':
-        conn.close()
-        return False
-    
-    end_time = datetime.fromisoformat(pomo['end_time'])
-    now = datetime.now()
-    paused_duration = (now - end_time).total_seconds() / 60
-    
-    new_duration = pomo['duration'] + int(paused_duration)
-    
-    cursor.execute('''
-    UPDATE pomodoros 
-    SET status = 'running', duration = ?, start_time = CURRENT_TIMESTAMP, end_time = NULL
-    WHERE id = ?
-    ''', (new_duration, pomodoro_id))
-    
-    conn.commit()
-    conn.close()
-    
-    return True, new_duration
-
-
-def complete_pomodoro(pomodoro_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM pomodoros WHERE id = ?', (pomodoro_id,))
-    pomo = cursor.fetchone()
-    
-    if not pomo:
-        conn.close()
-        return False
-    
-    cursor.execute('''
-    UPDATE pomodoros 
-    SET status = 'completed', end_time = CURRENT_TIMESTAMP
-    WHERE id = ?
-    ''', (pomodoro_id,))
-    
-    if pomo['task_id']:
-        cursor.execute('''
-        UPDATE tasks 
-        SET actual_time = COALESCE(actual_time, 0) + ?,
-            status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END
-        WHERE id = ?
-        ''', (pomo['duration'], pomo['task_id']))
-    
-    conn.commit()
-    conn.close()
-    
-    return True
-
-
-def add_interruption(pomodoro_id, note=None):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    UPDATE pomodoros 
-    SET interruptions = COALESCE(interruptions, 0) + 1,
-        interruption_notes = COALESCE(interruption_notes, '') || ?
-    WHERE id = ? AND status IN ('running', 'paused')
-    ''', (f"\n- {datetime.now().strftime('%H:%M')}: {note or '未记录原因'}", pomodoro_id))
-    
-    updated = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    
-    return updated
+    return run_interactive_session(session)
 
 
 def get_current_pomodoro():
@@ -171,50 +435,29 @@ def get_pomodoros_by_date(start_date, end_date=None):
     return rows
 
 
-def run_pomodoro_timer(pomodoro_id, duration, task_title=None):
-    total_seconds = duration * 60
+def get_date_range(range_type, start=None, end=None):
+    today = date.today()
     
-    console.print(f"\n[bold]🍅 番茄钟开始！[/bold]")
-    if task_title:
-        console.print(f"任务: {task_title}")
-    console.print(f"时长: {duration} 分钟\n")
+    if range_type == 'today':
+        return today, today
+    elif range_type == 'week':
+        from ..utils import get_week_range
+        return get_week_range(today)
+    elif range_type == 'month':
+        start = today.replace(day=1)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1) - timedelta(days=1)
+        else:
+            end = start.replace(month=start.month + 1) - timedelta(days=1)
+        return start, end
+    elif range_type == 'custom' and start and end:
+        from ..utils import parse_date
+        s = parse_date(start)
+        e = parse_date(end)
+        if s and e:
+            return s, e
     
-    with Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=None),
-        TimeRemainingColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("专注中...", total=total_seconds)
-        
-        try:
-            for second in range(total_seconds):
-                if get_global_pause_flag():
-                    console.print("\n[yellow]⏸️  番茄钟已暂停[/yellow]")
-                    return 'paused'
-                
-                progress.update(task, advance=1)
-                time.sleep(1)
-            
-            console.print("\n[green]🎉 番茄钟完成！[/green]")
-            complete_pomodoro(pomodoro_id)
-            return 'completed'
-            
-        except KeyboardInterrupt:
-            console.print("\n[yellow]⏸️  检测到中断，暂停番茄钟[/yellow]")
-            pause_pomodoro(pomodoro_id)
-            return 'paused'
-
-
-_global_pause_flag = [False]
-
-
-def get_global_pause_flag():
-    return _global_pause_flag[0]
-
-
-def set_global_pause_flag(value):
-    _global_pause_flag[0] = value
+    return today, today
 
 
 @click.group()
@@ -227,101 +470,15 @@ def focus():
 @click.option('-t', '--task', 'task_id', type=int, help='关联的任务ID')
 @click.option('-d', '--duration', type=int, help='番茄钟时长（分钟）')
 def start(task_id, duration):
-    """开始番茄钟"""
+    """开始番茄钟（交互式会话）"""
     current = get_current_pomodoro()
     if current and current['status'] == 'running':
-        console.print(f"[yellow]已有运行中的番茄钟 #id{current['id']}[/yellow]")
+        console.print(f"[yellow]已有运行中的番茄钟 #{current['id']}[/yellow]")
+        console.print("请先结束当前番茄钟，或使用 'focus pause' 暂停")
         return
     
-    pomo_id, dur = start_pomodoro(task_id, duration)
-    
-    task_title = None
-    if task_id:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT title FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            task_title = row['title']
-    
-    result = run_pomodoro_timer(pomo_id, dur, task_title)
-    
-    if result == 'completed':
-        short_break = get_config_value('short_break_duration')
-        console.print(f"\n☕ 休息 {short_break} 分钟吧！")
-
-
-@focus.command()
-def pause():
-    """暂停当前番茄钟"""
-    current = get_current_pomodoro()
-    if not current or current['status'] != 'running':
-        console.print("[yellow]没有运行中的番茄钟[/yellow]")
-        return
-    
-    set_global_pause_flag(True)
-    time.sleep(1.5)
-    
-    if pause_pomodoro(current['id']):
-        console.print(f"[green]✓ 番茄钟 #{current['id']} 已暂停[/green]")
-    set_global_pause_flag(False)
-
-
-@focus.command()
-def resume():
-    """恢复暂停的番茄钟"""
-    current = get_current_pomodoro()
-    if not current or current['status'] != 'paused':
-        console.print("[yellow]没有暂停中的番茄钟[/yellow]")
-        return
-    
-    result = resume_pomodoro(current['id'])
-    if result:
-        _, new_duration = result
-        
-        task_title = current['task_title']
-        start_time = datetime.fromisoformat(current['start_time'])
-        end_time = datetime.fromisoformat(current['end_time'])
-        paused_minutes = int((datetime.now() - end_time).total_seconds() / 60)
-        
-        console.print(f"[green]✓ 番茄钟 #{current['id']} 已恢复[/green]")
-        console.print(f"暂停时长: {paused_minutes} 分钟，已追加到总时长")
-        
-        run_pomodoro_timer(current['id'], new_duration, task_title)
-
-
-@focus.command()
-@click.option('-n', '--note', help='干扰原因记录')
-def interrupt(note):
-    """记录干扰"""
-    current = get_current_pomodoro()
-    if not current or current['status'] not in ('running', 'paused'):
-        console.print("[yellow]没有进行中的番茄钟[/yellow]")
-        return
-    
-    if add_interruption(current['id'], note):
-        console.print(f"[yellow]⚠️  已记录干扰 #{current['id']}[/yellow]")
-    else:
-        console.print("[red]✗ 记录失败[/red]")
-
-
-@focus.command()
-@click.argument('pomodoro_id', type=int, required=False)
-def stop(pomodoro_id):
-    """停止番茄钟"""
-    if pomodoro_id is None:
-        current = get_current_pomodoro()
-        if current:
-            pomodoro_id = current['id']
-        else:
-            console.print("[yellow]没有进行中的番茄钟[/yellow]")
-            return
-    
-    if complete_pomodoro(pomodoro_id):
-        console.print(f"[green]✓ 番茄钟 #{pomodoro_id} 已完成[/green]")
-    else:
-        console.print(f"[red]✗ 番茄钟 #{pomodoro_id} 不存在[/red]")
+    result = start_pomodoro(task_id, duration)
+    return result
 
 
 @focus.command()
@@ -330,7 +487,11 @@ def status():
     current = get_current_pomodoro()
     
     if not current:
-        console.print("[yellow]没有进行中的番茄钟[/yellow]")
+        console.print(Panel(
+            "[dim]当前没有进行中的番茄钟[/dim]\n\n"
+            "使用 [cyan]eff focus start[/cyan] 开始新的番茄钟",
+            title="🍅 番茄钟状态", border_style="dim"
+        ))
         return
     
     status_map = {
@@ -340,36 +501,51 @@ def status():
         'cancelled': '❌ 取消'
     }
     
-    console.print(f"[bold]🍅 当前番茄钟[/bold]")
-    console.print(f"ID: #{current['id']}")
-    console.print(f"状态: {status_map.get(current['status'], current['status'])}")
-    if current['task_title']:
-        console.print(f"任务: {current['task_title']}")
-    console.print(f"时长: {format_duration(current['duration'])}")
-    console.print(f"开始时间: {format_datetime(datetime.fromisoformat(current['start_time']))}")
+    start_time = datetime.fromisoformat(current['start_time'])
+    elapsed = (datetime.now() - start_time).total_seconds() / 60
+    remaining = max(0, current['duration'] - elapsed)
     
-    if current['interruptions']:
-        console.print(f"[yellow]干扰次数: {current['interruptions']}[/yellow]")
-        if current['interruption_notes']:
-            console.print(f"干扰记录: {current['interruption_notes']}")
+    console.print(Panel(
+        f"[bold]🍅 当前番茄钟 #{current['id']}[/bold]\n\n"
+        f"状态: [cyan]{status_map.get(current['status'], current['status'])}[/cyan]\n"
+        f"任务: {current['task_title'] or '无关联任务'}\n"
+        f"计划时长: {format_duration(current['duration'])}\n"
+        f"已进行: {format_duration(int(elapsed))}\n"
+        f"预计剩余: {format_duration(int(remaining))}\n"
+        f"干扰次数: {current['interruptions'] or 0}",
+        title="番茄钟状态", border_style="cyan"
+    ))
+    
+    if current['interruption_notes']:
+        console.print(f"\n[yellow]干扰记录:[/yellow]")
+        console.print(current['interruption_notes'])
 
 
 @focus.command()
-@click.option('-d', '--date', 'date_str', help='查看指定日期 (YYYY-MM-DD, today)')
-@click.option('-w', '--week', is_flag=True, help='查看本周统计')
-def log(date_str, week):
+@click.option('-r', '--range', 'range_type', 
+              type=click.Choice(['today', 'week', 'month', 'custom']), 
+              default='today', help='时间范围')
+@click.option('-s', '--start', help='自定义开始日期 (YYYY-MM-DD)')
+@click.option('-e', '--end', help='自定义结束日期 (YYYY-MM-DD)')
+def log(range_type, start, end):
     """查看番茄钟历史"""
-    if week:
-        from ..utils import get_week_range
-        start_date, end_date = get_week_range()
-    else:
-        target_date = parse_date(date_str) if date_str else date.today()
-        start_date = end_date = target_date
+    start_date, end_date = get_date_range(range_type, start, end)
     
     pomodoros = get_pomodoros_by_date(start_date, end_date)
     
     if not pomodoros:
-        console.print("[yellow]没有找到番茄钟记录[/yellow]")
+        range_label = {
+            'today': '今日',
+            'week': '本周',
+            'month': '本月',
+            'custom': f'{format_date(start_date)} 至 {format_date(end_date)}'
+        }[range_type]
+        
+        console.print(Panel(
+            f"[dim]{range_label}没有番茄钟记录[/dim]\n\n"
+            "使用 [cyan]eff focus start[/cyan] 开始你的第一个番茄钟吧！",
+            title="🍅 番茄钟历史", border_style="dim"
+        ))
         return
     
     table = Table(show_header=True, header_style="bold magenta")
@@ -404,17 +580,26 @@ def log(date_str, week):
             format_datetime(datetime.fromisoformat(pomo['start_time']))
         )
     
+    range_label = {
+        'today': '今日',
+        'week': '本周',
+        'month': '本月',
+        'custom': '自定义'
+    }[range_type]
+    
+    console.print(f"[bold]🍅 {range_label}番茄钟记录[/bold]")
+    if range_type == 'custom':
+        console.print(f"[dim]{format_date(start_date)} 至 {format_date(end_date)}[/dim]")
+    console.print()
+    
     console.print(table)
     
-    if week:
-        console.print(f"\n📊 本周统计:")
-    else:
-        console.print(f"\n📊 当日统计:")
+    console.print(f"\n📊 统计:")
     console.print(f"  完成番茄钟: {completed_count} 个")
     console.print(f"  总专注时长: {format_duration(total_duration)}")
     
-    daily_goal = get_config_value('daily_pomodoro_goal')
-    if not week and date_str is None:
+    if range_type == 'today':
+        daily_goal = get_config_value('daily_pomodoro_goal')
         if completed_count >= daily_goal:
             console.print(f"  [green]🎯 已达成每日目标 ({daily_goal}个)[/green]")
         else:

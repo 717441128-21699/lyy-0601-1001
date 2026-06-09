@@ -2,6 +2,7 @@ import click
 from datetime import datetime
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
 from rich.prompt import Confirm
 
 from ..database import get_connection
@@ -11,6 +12,7 @@ from ..utils import (
     tags_to_str, is_overdue
 )
 from ..config import get_config_value
+from ..search_history import record_search, get_last_search
 
 console = Console()
 
@@ -167,6 +169,13 @@ def delete_task(task_id):
     conn = get_connection()
     cursor = conn.cursor()
     
+    cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
+    task = cursor.fetchone()
+    
+    if not task:
+        conn.close()
+        return False
+    
     cursor.execute('DELETE FROM tasks WHERE parent_id = ?', (task_id,))
     cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
     
@@ -319,7 +328,9 @@ def delete(task_id):
     """删除任务"""
     if Confirm.ask(f"确定要删除任务 {task_id} 及其所有子任务吗？"):
         if delete_task(task_id):
-            console.print(f"[green]✓ 任务已删除[/green]")
+            console.print(f"[green]✓ 任务 {task_id} 已删除[/green]")
+        else:
+            console.print(f"[red]✗ 任务 {task_id} 不存在[/red]")
 
 
 @task.command()
@@ -351,7 +362,46 @@ def search(keyword):
     tasks = cursor.fetchall()
     conn.close()
     
-    display_tasks(tasks)
+    record_search(keyword, 'task', len(tasks))
+    
+    if not tasks:
+        console.print(Panel(
+            f"[dim]没有找到包含 '{keyword}' 的任务[/dim]\n\n"
+            "试试其他关键词，或使用 [cyan]eff task list[/cyan] 查看所有任务",
+            title="🔍 搜索结果", border_style="dim"
+        ))
+    else:
+        console.print(f"[dim]找到 {len(tasks)} 个匹配的任务[/dim]")
+        display_tasks(tasks)
+
+
+@task.command()
+@click.option('-r', '--run', is_flag=True, help='直接运行上次搜索')
+def last(run):
+    """查看或复用上次搜索"""
+    last = get_last_search('task')
+    
+    if not last:
+        console.print(Panel(
+            "[dim]还没有搜索记录[/dim]\n\n"
+            "使用 [cyan]eff task search <关键词>[/cyan] 开始搜索",
+            title="🔍 最近搜索", border_style="dim"
+        ))
+        return
+    
+    keyword = last['keyword']
+    hit_count = last['hit_count']
+    searched_at = datetime.fromisoformat(last['created_at'])
+    
+    console.print(f"[bold]🔍 上次任务搜索[/bold]\n")
+    console.print(f"  关键词: [cyan]{keyword}[/cyan]")
+    console.print(f"  命中数: {hit_count}")
+    console.print(f"  搜索时间: {format_datetime(searched_at)}")
+    
+    if run:
+        console.print(f"\n[cyan]正在重新搜索...[/cyan]\n")
+        ctx = click.get_current_context()
+        ctx.invoke(search, keyword=keyword)
 
 
 @task.command()

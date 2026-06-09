@@ -1,6 +1,7 @@
 import click
 from datetime import datetime, date, timedelta
 from collections import defaultdict
+from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -9,38 +10,45 @@ from ..database import get_connection
 from ..utils import (
     format_date, format_duration, format_datetime,
     get_priority_label, get_status_label, is_overdue,
-    get_week_range
+    get_week_range, get_date_range, get_range_label
 )
 from ..config import get_config_value
 
 console = Console()
 
 
-def get_time_stats(days=30):
-    end_date = date.today()
-    start_date = end_date - timedelta(days=days - 1)
-    
+def get_time_stats_by_range(start_date, end_date):
+    """按日期范围获取统计数据"""
     conn = get_connection()
     cursor = conn.cursor()
     
     stats = {
+        'start_date': start_date,
+        'end_date': end_date,
+        'total_days': (end_date - start_date).days + 1,
         'total_tasks': 0,
         'completed_tasks': 0,
         'incomplete_tasks': 0,
         'total_focus': 0,
         'total_pomodoros': 0,
         'avg_focus_per_day': 0,
+        'completion_rate': 0,
         'by_priority': defaultdict(lambda: {'total': 0, 'completed': 0}),
         'by_tag': defaultdict(lambda: {'total': 0, 'completed': 0, 'focus': 0}),
-        'daily_focus': defaultdict(int)
+        'daily_focus': defaultdict(int),
+        'daily_tasks': defaultdict(lambda: {'created': 0, 'completed': 0}),
+        'tasks': [],
+        'pomodoros': [],
+        'notes': []
     }
     
     cursor.execute('''
     SELECT * FROM tasks 
-    WHERE DATE(created_at) >= ?
-    ''', (start_date.isoformat(),))
+    WHERE DATE(created_at) BETWEEN ? AND ?
+    ''', (start_date.isoformat(), end_date.isoformat()))
     
     tasks = cursor.fetchall()
+    stats['tasks'] = tasks
     stats['total_tasks'] = len(tasks)
     
     for task in tasks:
@@ -60,13 +68,22 @@ def get_time_stats(days=30):
                         stats['by_tag'][tag]['completed'] += 1
                     if task['actual_time']:
                         stats['by_tag'][tag]['focus'] += task['actual_time']
+        
+        created_date = date.fromisoformat(task['created_at'][:10])
+        stats['daily_tasks'][created_date]['created'] += 1
+        if task['completed_at']:
+            completed_date = date.fromisoformat(task['completed_at'][:10])
+            stats['daily_tasks'][completed_date]['completed'] += 1
+    
+    if stats['total_tasks'] > 0:
+        stats['completion_rate'] = stats['completed_tasks'] / stats['total_tasks'] * 100
     
     cursor.execute('''
     SELECT DATE(start_time) as d, SUM(duration) as dur, COUNT(*) as cnt
     FROM pomodoros 
-    WHERE DATE(start_time) >= ? AND status = 'completed'
+    WHERE DATE(start_time) BETWEEN ? AND ? AND status = 'completed'
     GROUP BY DATE(start_time)
-    ''', (start_date.isoformat(),))
+    ''', (start_date.isoformat(), end_date.isoformat()))
     
     for row in cursor.fetchall():
         d = date.fromisoformat(row['d'])
@@ -74,10 +91,24 @@ def get_time_stats(days=30):
         stats['total_focus'] += row['dur'] or 0
         stats['total_pomodoros'] += row['cnt']
     
+    cursor.execute('''
+    SELECT * FROM pomodoros 
+    WHERE DATE(start_time) BETWEEN ? AND ? AND status = 'completed'
+    ORDER BY start_time
+    ''', (start_date.isoformat(), end_date.isoformat()))
+    stats['pomodoros'] = cursor.fetchall()
+    
+    cursor.execute('''
+    SELECT * FROM notes 
+    WHERE DATE(created_at) BETWEEN ? AND ?
+    ORDER BY created_at
+    ''', (start_date.isoformat(), end_date.isoformat()))
+    stats['notes'] = cursor.fetchall()
+    
     conn.close()
     
-    if days > 0:
-        stats['avg_focus_per_day'] = stats['total_focus'] / days
+    if stats['total_days'] > 0:
+        stats['avg_focus_per_day'] = stats['total_focus'] / stats['total_days']
     
     return stats
 
@@ -104,10 +135,7 @@ def get_overdue_tasks():
     return tasks
 
 
-def get_efficiency_metrics(days=30):
-    end_date = date.today()
-    start_date = end_date - timedelta(days=days - 1)
-    
+def get_efficiency_metrics(start_date, end_date):
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -118,8 +146,8 @@ def get_efficiency_metrics(days=30):
         SUM(estimated_time) as total_estimated,
         SUM(actual_time) as total_actual
     FROM tasks
-    WHERE DATE(created_at) >= ?
-    ''', (start_date.isoformat(),))
+    WHERE DATE(created_at) BETWEEN ? AND ?
+    ''', (start_date.isoformat(), end_date.isoformat()))
     
     row = cursor.fetchone()
     conn.close()
@@ -139,6 +167,166 @@ def get_efficiency_metrics(days=30):
     return metrics
 
 
+def generate_stats_report(stats, metrics, fmt='txt'):
+    """生成统计报告"""
+    start_date = stats['start_date']
+    end_date = stats['end_date']
+    range_label = f"{format_date(start_date)} 至 {format_date(end_date)}"
+    
+    if fmt == 'markdown':
+        lines = []
+        lines.append(f"# 统计报告 - {range_label}")
+        lines.append("")
+        lines.append("## 📈 概览统计")
+        lines.append("")
+        lines.append("| 指标 | 数值 |")
+        lines.append("|------|------|")
+        lines.append(f"| 新增任务 | {stats['total_tasks']} 个 |")
+        lines.append(f"| 完成任务 | {stats['completed_tasks']} 个 |")
+        lines.append(f"| 完成率 | {stats['completion_rate']:.1f}% |")
+        lines.append(f"| 进行中 | {stats['incomplete_tasks']} 个 |")
+        lines.append(f"| 番茄钟 | {stats['total_pomodoros']} 个 |")
+        lines.append(f"| 总专注时长 | {format_duration(stats['total_focus'])} |")
+        lines.append(f"| 日均专注 | {format_duration(int(stats['avg_focus_per_day']))} |")
+        lines.append(f"| 预估准确度 | {metrics['estimation_accuracy']:.1f}% |")
+        lines.append("")
+        
+        if stats['by_priority']:
+            lines.append("## 🎯 按优先级统计")
+            lines.append("")
+            lines.append("| 优先级 | 总数 | 已完成 | 完成率 |")
+            lines.append("|--------|------|--------|--------|")
+            for priority in sorted(stats['by_priority'].keys(), reverse=True):
+                data = stats['by_priority'][priority]
+                rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
+                p_label = {4: '🔴 紧急', 3: '🟠 高', 2: '🟡 中', 1: '🟢 低'}[priority]
+                lines.append(f"| {p_label} | {data['total']} | {data['completed']} | {rate:.1f}% |")
+            lines.append("")
+        
+        if stats['by_tag']:
+            lines.append("## 🏷️  按标签统计")
+            lines.append("")
+            lines.append("| 标签 | 任务数 | 已完成 | 完成率 | 专注时长 |")
+            lines.append("|------|--------|--------|--------|----------|")
+            for tag, data in sorted(stats['by_tag'].items(), key=lambda x: -x[1]['total']):
+                rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
+                lines.append(f"| {tag} | {data['total']} | {data['completed']} | {rate:.1f}% | {format_duration(data['focus'])} |")
+            lines.append("")
+        
+        if stats['tasks']:
+            lines.append("## 📋 任务列表")
+            lines.append("")
+            lines.append("| ID | 标题 | 优先级 | 状态 | 创建时间 | 完成时间 |")
+            lines.append("|----|------|--------|------|----------|----------|")
+            for task in stats['tasks']:
+                p_label = {4: '🔴 紧急', 3: '🟠 高', 2: '🟡 中', 1: '🟢 低'}[task['priority']]
+                s_label = {'pending': '⏳ 待办', 'in_progress': '🔄 进行中', 'completed': '✅ 完成', 'cancelled': '❌ 取消'}[task['status']]
+                created_at = task['created_at'][:16].replace('T', ' ')
+                completed_at = task['completed_at'][:16].replace('T', ' ') if task['completed_at'] else '-'
+                lines.append(f"| {task['id']} | {task['title']} | {p_label} | {s_label} | {created_at} | {completed_at} |")
+            lines.append("")
+        
+        if stats['pomodoros']:
+            lines.append("## 🍅 番茄钟记录")
+            lines.append("")
+            lines.append("| ID | 任务 | 时长 | 干扰 | 开始时间 |")
+            lines.append("|----|------|------|------|----------|")
+            for pomo in stats['pomodoros']:
+                task_title = pomo.get('task_title') or '无关联任务'
+                start_time = pomo['start_time'][:16].replace('T', ' ')
+                inter = pomo['interruptions'] or 0
+                lines.append(f"| {pomo['id']} | {task_title} | {format_duration(pomo['duration'])} | {inter} | {start_time} |")
+            lines.append("")
+        
+        if stats['notes']:
+            lines.append("## 📝 笔记摘要")
+            lines.append("")
+            lines.append("| ID | 分类 | 内容摘要 | 创建时间 |")
+            lines.append("|----|------|----------|----------|")
+            for note in stats['notes']:
+                content = note['content'][:50].replace('|', '\\|') + '...' if len(note['content']) > 50 else note['content'].replace('|', '\\|')
+                category = note['category'] or '普通'
+                created_at = note['created_at'][:16].replace('T', ' ')
+                lines.append(f"| {note['id']} | {category} | {content} | {created_at} |")
+            lines.append("")
+        
+        return '\n'.join(lines)
+    
+    else:
+        lines = []
+        lines.append(f"=== 统计报告 - {range_label} ===")
+        lines.append("")
+        lines.append("📈 概览统计")
+        lines.append(f"  新增任务: {stats['total_tasks']} 个")
+        lines.append(f"  完成任务: {stats['completed_tasks']} 个")
+        lines.append(f"  完成率: {stats['completion_rate']:.1f}%")
+        lines.append(f"  进行中: {stats['incomplete_tasks']} 个")
+        lines.append(f"  番茄钟: {stats['total_pomodoros']} 个")
+        lines.append(f"  总专注时长: {format_duration(stats['total_focus'])}")
+        lines.append(f"  日均专注: {format_duration(int(stats['avg_focus_per_day']))}")
+        lines.append(f"  预估准确度: {metrics['estimation_accuracy']:.1f}%")
+        lines.append("")
+        
+        if stats['by_priority']:
+            lines.append("🎯 按优先级统计")
+            for priority in sorted(stats['by_priority'].keys(), reverse=True):
+                data = stats['by_priority'][priority]
+                rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
+                p_label = {4: '🔴 紧急', 3: '🟠 高', 2: '🟡 中', 1: '🟢 低'}[priority]
+                lines.append(f"  {p_label}: {data['total']}个任务, {data['completed']}个完成, 完成率{rate:.1f}%")
+            lines.append("")
+        
+        if stats['by_tag']:
+            lines.append("🏷️  按标签统计 (Top 10)")
+            for tag, data in sorted(stats['by_tag'].items(), key=lambda x: -x[1]['total'])[:10]:
+                rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
+                lines.append(f"  {tag}: {data['total']}个任务, {format_duration(data['focus'])}专注, 完成率{rate:.1f}%")
+            lines.append("")
+        
+        return '\n'.join(lines)
+
+
+def export_report(content, range_type, start_date, end_date, fmt='txt'):
+    """导出报告到文件"""
+    export_dir = Path(get_config_value('export_dir')).expanduser()
+    export_dir.mkdir(parents=True, exist_ok=True)
+    
+    ext = fmt
+    range_label = {
+        'today': 'today',
+        'week': 'week',
+        'month': 'month',
+        'custom': f"{start_date.isoformat()}_{end_date.isoformat()}"
+    }.get(range_type, 'custom')
+    
+    filename = f"stats_{range_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+    file_path = export_dir / filename
+    
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    return file_path
+
+
+def add_date_range_options(f):
+    """添加日期范围选项的装饰器"""
+    f = click.option('-r', '--range', 'range_type',
+                     type=click.Choice(['today', 'week', 'month', 'custom']),
+                     default='month', help='时间范围')(f)
+    f = click.option('-s', '--start', help='自定义开始日期 (YYYY-MM-DD)')(f)
+    f = click.option('-e', '--end', help='自定义结束日期 (YYYY-MM-DD)')(f)
+    return f
+
+
+def add_export_options(f):
+    """添加导出选项的装饰器"""
+    f = click.option('--export', 'export_fmt',
+                     type=click.Choice(['txt', 'markdown']),
+                     help='导出报告格式')(f)
+    f = click.option('-o', '--output', help='导出文件名（可选）')(f)
+    return f
+
+
 @click.group()
 def stats():
     """统计分析"""
@@ -146,18 +334,30 @@ def stats():
 
 
 @stats.command()
-@click.option('-d', '--days', type=int, default=30, help='统计天数')
-def overview(days):
+@add_date_range_options
+@add_export_options
+def overview(range_type, start, end, export_fmt, output):
     """总体统计概览"""
-    time_stats = get_time_stats(days)
-    metrics = get_efficiency_metrics(days)
+    start_date, end_date = get_date_range(range_type, start, end)
+    range_label = get_range_label(range_type, start_date, end_date)
+    
+    time_stats = get_time_stats_by_range(start_date, end_date)
+    metrics = get_efficiency_metrics(start_date, end_date)
+    
+    if time_stats['total_tasks'] == 0 and time_stats['total_pomodoros'] == 0:
+        console.print(Panel(
+            f"[dim]{range_label}没有统计数据[/dim]\n\n"
+            "开始使用 eff 添加任务和番茄钟后，这里会显示统计信息",
+            title=f"📊 {range_label}统计概览", border_style="dim"
+        ))
+        return
     
     console.print(Panel.fit(
-        f"[bold]📊 {days} 天统计概览[/bold]\n\n"
+        f"[bold]📊 {range_label}统计概览[/bold]\n\n"
         f"📋 任务统计\n"
         f"  新增任务: {time_stats['total_tasks']} 个\n"
         f"  完成任务: {time_stats['completed_tasks']} 个\n"
-        f"  完成率: {time_stats['completed_tasks']/time_stats['total_tasks']*100:.1f}%  \n"
+        f"  完成率: {time_stats['completion_rate']:.1f}%  \n"
         f"  进行中: {time_stats['incomplete_tasks']} 个\n\n"
         f"🍅 专注统计\n"
         f"  番茄钟: {time_stats['total_pomodoros']} 个\n"
@@ -166,8 +366,13 @@ def overview(days):
         f"📈 效率指标\n"
         f"  平均完成耗时: {format_duration(int(metrics['avg_completion_time']))}\n"
         f"  预估准确度: {metrics['estimation_accuracy']:.1f}%",
-        title="统计概览", border_style="blue"
+        title=f"📊 {range_label}统计", border_style="blue"
     ))
+    
+    if export_fmt:
+        report = generate_stats_report(time_stats, metrics, fmt=export_fmt)
+        file_path = export_report(report, range_type, start_date, end_date, fmt=export_fmt)
+        console.print(f"\n[green]✓ 报告已导出到: {file_path}[/green]")
 
 
 @stats.command()
@@ -176,7 +381,11 @@ def overdue():
     tasks = get_overdue_tasks()
     
     if not tasks:
-        console.print("[green]🎉 没有逾期任务！干得漂亮！[/green]")
+        console.print(Panel(
+            "[dim]没有逾期任务[/dim]\n\n"
+            "[green]🎉 干得漂亮！继续保持[/green]",
+            title="⚠️  逾期任务提醒", border_style="green"
+        ))
         return
     
     console.print(f"[bold red]⚠️  逾期任务提醒 ({len(tasks)} 个)[/bold red]\n")
@@ -205,12 +414,23 @@ def overdue():
 
 
 @stats.command()
-@click.option('-d', '--days', type=int, default=30, help='统计天数')
-def priority(days):
+@add_date_range_options
+@add_export_options
+def priority(range_type, start, end, export_fmt, output):
     """按优先级统计"""
-    stats = get_time_stats(days)
+    start_date, end_date = get_date_range(range_type, start, end)
+    range_label = get_range_label(range_type, start_date, end_date)
     
-    console.print(f"[bold]📊 {days} 天优先级分布[/bold]\n")
+    time_stats = get_time_stats_by_range(start_date, end_date)
+    
+    if not time_stats['by_priority']:
+        console.print(Panel(
+            f"[dim]{range_label}没有优先级统计数据[/dim]",
+            title=f"🎯 {range_label}优先级分布", border_style="dim"
+        ))
+        return
+    
+    console.print(f"[bold]📊 {range_label}优先级分布[/bold]\n")
     
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("优先级", width=12)
@@ -218,8 +438,8 @@ def priority(days):
     table.add_column("已完成", width=10)
     table.add_column("完成率", width=12)
     
-    for priority in sorted(stats['by_priority'].keys(), reverse=True):
-        data = stats['by_priority'][priority]
+    for priority in sorted(time_stats['by_priority'].keys(), reverse=True):
+        data = time_stats['by_priority'][priority]
         completion_rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
         
         table.add_row(
@@ -230,20 +450,34 @@ def priority(days):
         )
     
     console.print(table)
+    
+    if export_fmt:
+        metrics = get_efficiency_metrics(start_date, end_date)
+        report = generate_stats_report(time_stats, metrics, fmt=export_fmt)
+        file_path = export_report(report, range_type, start_date, end_date, fmt=export_fmt)
+        console.print(f"\n[green]✓ 报告已导出到: {file_path}[/green]")
 
 
 @stats.command()
-@click.option('-d', '--days', type=int, default=30, help='统计天数')
+@add_date_range_options
 @click.option('-n', '--limit', type=int, default=10, help='显示标签数量')
-def tags(days, limit):
+@add_export_options
+def tags(range_type, start, end, limit, export_fmt, output):
     """按标签统计"""
-    stats = get_time_stats(days)
+    start_date, end_date = get_date_range(range_type, start, end)
+    range_label = get_range_label(range_type, start_date, end_date)
     
-    if not stats['by_tag']:
-        console.print("[yellow]没有找到标签数据[/yellow]")
+    time_stats = get_time_stats_by_range(start_date, end_date)
+    
+    if not time_stats['by_tag']:
+        console.print(Panel(
+            f"[dim]{range_label}没有标签统计数据[/dim]\n\n"
+            "给任务添加标签后，这里会显示标签统计",
+            title=f"🏷️  {range_label}标签统计", border_style="dim"
+        ))
         return
     
-    console.print(f"[bold]📊 {days} 天标签统计 (Top {limit})[/bold]\n")
+    console.print(f"[bold]📊 {range_label}标签统计 (Top {limit})[/bold]\n")
     
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("标签", width=15)
@@ -253,7 +487,7 @@ def tags(days, limit):
     table.add_column("专注时长", width=12)
     
     sorted_tags = sorted(
-        stats['by_tag'].items(), 
+        time_stats['by_tag'].items(), 
         key=lambda x: x[1]['total'], 
         reverse=True
     )[:limit]
@@ -270,25 +504,39 @@ def tags(days, limit):
         )
     
     console.print(table)
+    
+    if export_fmt:
+        metrics = get_efficiency_metrics(start_date, end_date)
+        report = generate_stats_report(time_stats, metrics, fmt=export_fmt)
+        file_path = export_report(report, range_type, start_date, end_date, fmt=export_fmt)
+        console.print(f"\n[green]✓ 报告已导出到: {file_path}[/green]")
 
 
 @stats.command()
-@click.option('-d', '--days', type=int, default=30, help='统计天数')
-def time(days):
+@add_date_range_options
+@add_export_options
+def time(range_type, start, end, export_fmt, output):
     """耗时统计"""
-    stats = get_time_stats(days)
+    start_date, end_date = get_date_range(range_type, start, end)
+    range_label = get_range_label(range_type, start_date, end_date)
     
-    console.print(f"[bold]⏱️  {days} 天耗时统计[/bold]\n")
+    time_stats = get_time_stats_by_range(start_date, end_date)
     
-    if not stats['daily_focus']:
-        console.print("[yellow]没有找到专注记录[/yellow]")
+    if not time_stats['daily_focus']:
+        console.print(Panel(
+            f"[dim]{range_label}没有专注记录[/dim]\n\n"
+            "使用 [cyan]eff focus start[/cyan] 开始番茄钟吧！",
+            title=f"⏱️  {range_label}耗时统计", border_style="dim"
+        ))
         return
     
-    weekly_data = defaultdict(lambda: {'focus': 0, 'days': 0})
-    for d, focus in stats['daily_focus'].items():
+    console.print(f"[bold]⏱️  {range_label}耗时统计[/bold]\n")
+    
+    weekly_data = defaultdict(lambda: {'focus': 0, 'days': set()})
+    for d, focus in time_stats['daily_focus'].items():
         week_start = d - timedelta(days=d.weekday())
         weekly_data[week_start]['focus'] += focus
-        weekly_data[week_start]['days'] += 1
+        weekly_data[week_start]['days'].add(d)
     
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("周期", width=20)
@@ -296,10 +544,14 @@ def time(days):
     table.add_column("日均专注", width=12)
     table.add_column("活跃度", width=15)
     
+    all_focus = time_stats['daily_focus'].values()
+    max_focus = max(all_focus) if all_focus else 1
+    
     for week_start in sorted(weekly_data.keys(), reverse=True):
         week_end = week_start + timedelta(days=6)
         data = weekly_data[week_start]
-        avg_focus = data['focus'] / max(data['days'], 1)
+        days_count = len(data['days'])
+        avg_focus = data['focus'] / max(days_count, 1)
         activity = '█' * min(int(avg_focus / 30), 10)
         
         table.add_row(
@@ -310,35 +562,59 @@ def time(days):
         )
     
     console.print(table)
+    
+    if export_fmt:
+        metrics = get_efficiency_metrics(start_date, end_date)
+        report = generate_stats_report(time_stats, metrics, fmt=export_fmt)
+        file_path = export_report(report, range_type, start_date, end_date, fmt=export_fmt)
+        console.print(f"\n[green]✓ 报告已导出到: {file_path}[/green]")
 
 
 @stats.command()
-@click.option('-d', '--days', type=int, default=7, help='统计天数')
-def daily(days):
+@add_date_range_options
+def daily(range_type, start, end):
     """每日统计"""
-    stats = get_time_stats(days)
+    start_date, end_date = get_date_range(range_type, start, end)
+    range_label = get_range_label(range_type, start_date, end_date)
     
-    console.print(f"[bold]📅 最近 {days} 天每日统计[/bold]\n")
+    time_stats = get_time_stats_by_range(start_date, end_date)
+    
+    if not time_stats['daily_focus'] and not time_stats['daily_tasks']:
+        console.print(Panel(
+            f"[dim]{range_label}没有每日统计数据[/dim]",
+            title=f"📅 {range_label}每日统计", border_style="dim"
+        ))
+        return
+    
+    console.print(f"[bold]📅 {range_label}每日统计[/bold]\n")
     
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("日期", width=12)
+    table.add_column("新增任务", width=10)
+    table.add_column("完成任务", width=10)
     table.add_column("专注", width=12)
     table.add_column("番茄钟", width=10)
     table.add_column("趋势", width=20)
     
-    max_focus = max(stats['daily_focus'].values()) if stats['daily_focus'] else 1
+    all_focus = time_stats['daily_focus'].values()
+    max_focus = max(all_focus) if all_focus else 1
     
-    today = date.today()
-    for i in range(days - 1, -1, -1):
-        d = today - timedelta(days=i)
-        focus = stats['daily_focus'].get(d, 0)
+    days_count = (end_date - start_date).days + 1
+    for i in range(days_count):
+        d = start_date + timedelta(days=i)
+        focus = time_stats['daily_focus'].get(d, 0)
+        created = time_stats['daily_tasks'].get(d, {}).get('created', 0)
+        completed = time_stats['daily_tasks'].get(d, {}).get('completed', 0)
+        pomodoros = int(focus / 25) if focus > 0 else 0
         bar_length = int(focus / max_focus * 15) if max_focus > 0 else 0
-        bar = '█' * bar_length
+        bar = '█' * bar_length + '░' * (15 - bar_length)
         
         table.add_row(
             format_date(d),
+            str(created),
+            str(completed),
             format_duration(focus),
-            str(int(focus / 25)) if focus > 0 else '-',
+            str(pomodoros) if pomodoros > 0 else '-',
             bar
         )
     
@@ -346,7 +622,8 @@ def daily(days):
 
 
 @stats.command()
-def summary():
+@add_export_options
+def summary(export_fmt, output):
     """显示完整统计摘要"""
     today = date.today()
     week_start, week_end = get_week_range()
@@ -378,6 +655,16 @@ def summary():
     daily_goal = get_config_value('daily_pomodoro_goal')
     today_pomodoros = int(today_focus / 25)
     
+    if pending == 0 and completed == 0 and today_focus == 0:
+        console.print(Panel(
+            "[dim]还没有任何数据[/dim]\n\n"
+            "开始使用 eff 来管理你的任务和时间吧！\n"
+            "  [cyan]eff task add <标题>[/cyan] - 添加任务\n"
+            "  [cyan]eff focus start[/cyan] - 开始番茄钟",
+            title="📊 效率摘要", border_style="dim"
+        ))
+        return
+    
     console.print(Panel(
         f"[bold]📊 今日摘要[/bold]\n\n"
         f"📋 待办任务: {pending} 个\n"
@@ -393,3 +680,10 @@ def summary():
     
     if overdue:
         console.print("\n[yellow]💡 建议: 先处理高优先级的逾期任务[/yellow]")
+    
+    if export_fmt:
+        time_stats = get_time_stats_by_range(week_start, week_end)
+        metrics = get_efficiency_metrics(week_start, week_end)
+        report = generate_stats_report(time_stats, metrics, fmt=export_fmt)
+        file_path = export_report(report, 'week', week_start, week_end, fmt=export_fmt)
+        console.print(f"\n[green]✓ 报告已导出到: {file_path}[/green]")

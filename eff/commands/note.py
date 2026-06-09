@@ -8,6 +8,7 @@ from rich.prompt import Confirm
 
 from ..database import get_connection
 from ..utils import format_datetime, parse_tags, tags_to_str
+from ..search_history import record_search, get_last_search
 
 console = Console()
 
@@ -212,7 +213,47 @@ def list_cmd(category, tag, limit):
 def search(keyword):
     """搜索笔记"""
     notes = search_notes(keyword)
-    display_notes(notes)
+    
+    record_search(keyword, 'note', len(notes))
+    
+    if not notes:
+        console.print(Panel(
+            f"[dim]没有找到包含 '{keyword}' 的笔记[/dim]\n\n"
+            "试试其他关键词，或使用 [cyan]eff note list[/cyan] 查看所有笔记",
+            title="🔍 搜索结果", border_style="dim"
+        ))
+    else:
+        console.print(f"[dim]找到 {len(notes)} 个匹配的笔记[/dim]")
+        display_notes(notes)
+
+
+@note.command()
+@click.option('-r', '--run', is_flag=True, help='直接运行上次搜索')
+def last(run):
+    """查看或复用上次搜索"""
+    last = get_last_search('note')
+    
+    if not last:
+        console.print(Panel(
+            "[dim]还没有搜索记录[/dim]\n\n"
+            "使用 [cyan]eff note search <关键词>[/cyan] 开始搜索",
+            title="🔍 最近搜索", border_style="dim"
+        ))
+        return
+    
+    keyword = last['keyword']
+    hit_count = last['hit_count']
+    searched_at = datetime.fromisoformat(last['created_at'])
+    
+    console.print(f"[bold]🔍 上次笔记搜索[/bold]\n")
+    console.print(f"  关键词: [cyan]{keyword}[/cyan]")
+    console.print(f"  命中数: {hit_count}")
+    console.print(f"  搜索时间: {format_datetime(searched_at)}")
+    
+    if run:
+        console.print(f"\n[cyan]正在重新搜索...[/cyan]\n")
+        ctx = click.get_current_context()
+        ctx.invoke(search, keyword=keyword)
 
 
 @note.command()

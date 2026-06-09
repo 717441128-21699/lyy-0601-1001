@@ -100,3 +100,47 @@ def tags_to_str(tags):
     if not tags:
         return ''
     return ','.join(tags)
+
+
+def get_date_range(range_type, start=None, end=None):
+    """获取日期范围
+    
+    range_type: today, week, month, custom
+    """
+    today = date.today()
+    
+    if range_type == 'today':
+        return today, today
+    elif range_type == 'week':
+        return get_week_range(today)
+    elif range_type == 'month':
+        start = today.replace(day=1)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1) - timedelta(days=1)
+        else:
+            end = start.replace(month=start.month + 1) - timedelta(days=1)
+        return start, end
+    elif range_type == 'custom' and start and end:
+        s = parse_date(start)
+        e = parse_date(end)
+        if s and e:
+            return s, e
+    
+    return today, today
+
+
+def get_range_label(range_type, start_date=None, end_date=None):
+    """获取日期范围的显示标签"""
+    labels = {
+        'today': '今日',
+        'week': '本周',
+        'month': '本月',
+        'custom': '自定义'
+    }
+    
+    label = labels.get(range_type, range_type)
+    
+    if range_type == 'custom' and start_date and end_date:
+        label = f"{format_date(start_date)} 至 {format_date(end_date)}"
+    
+    return label
