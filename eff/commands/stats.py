@@ -1,4 +1,5 @@
 import click
+import json
 from datetime import datetime, date, timedelta
 from collections import defaultdict
 from pathlib import Path
@@ -175,7 +176,94 @@ def generate_stats_report(stats, metrics, fmt='txt'):
     end_date = stats['end_date']
     range_label = f"{format_date(start_date)} 至 {format_date(end_date)}"
     
-    if fmt == 'markdown':
+    if fmt == 'json':
+        report = {
+            'meta': {
+                'report_type': 'stats',
+                'generated_at': datetime.now().isoformat(),
+                'range': {
+                    'start_date': start_date.isoformat(),
+                    'end_date': end_date.isoformat(),
+                    'label': range_label
+                }
+            },
+            'overview': {
+                'total_tasks': stats['total_tasks'],
+                'completed_tasks': stats['completed_tasks'],
+                'incomplete_tasks': stats['incomplete_tasks'],
+                'completion_rate': round(stats['completion_rate'], 1),
+                'total_pomodoros': stats['total_pomodoros'],
+                'total_focus_minutes': stats['total_focus'],
+                'avg_focus_per_day_minutes': int(stats['avg_focus_per_day']),
+                'estimation_accuracy': round(metrics['estimation_accuracy'], 1),
+                'avg_completion_time_minutes': int(metrics['avg_completion_time'])
+            },
+            'by_priority': {},
+            'by_tag': {},
+            'tasks': [],
+            'pomodoros': [],
+            'notes': []
+        }
+        
+        for priority, data in stats['by_priority'].items():
+            p_label = {4: '紧急', 3: '高', 2: '中', 1: '低'}[priority]
+            rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
+            report['by_priority'][p_label] = {
+                'total': data['total'],
+                'completed': data['completed'],
+                'completion_rate': round(rate, 1)
+            }
+        
+        for tag, data in stats['by_tag'].items():
+            rate = data['completed'] / data['total'] * 100 if data['total'] > 0 else 0
+            report['by_tag'][tag] = {
+                'total': data['total'],
+                'completed': data['completed'],
+                'completion_rate': round(rate, 1),
+                'focus_minutes': data['focus']
+            }
+        
+        for task in stats['tasks']:
+            report['tasks'].append({
+                'id': task['id'],
+                'title': task['title'],
+                'description': task['description'],
+                'priority': {4: '紧急', 3: '高', 2: '中', 1: '低'}[task['priority']],
+                'status': {'pending': '待办', 'in_progress': '进行中', 'completed': '完成', 'cancelled': '取消'}[task['status']],
+                'tags': task['tags'].split(',') if task['tags'] else [],
+                'due_date': task['due_date'],
+                'estimated_time': task['estimated_time'],
+                'actual_time': task['actual_time'],
+                'created_at': task['created_at'],
+                'completed_at': task['completed_at']
+            })
+        
+        for pomo in stats['pomodoros']:
+            report['pomodoros'].append({
+                'id': pomo['id'],
+                'task_id': pomo['task_id'],
+                'task_title': pomo.get('task_title'),
+                'duration_minutes': pomo['duration'],
+                'interruptions': pomo['interruptions'] or 0,
+                'interruption_notes': pomo['interruption_notes'],
+                'start_time': pomo['start_time'],
+                'end_time': pomo['end_time']
+            })
+        
+        for note in stats['notes']:
+            report['notes'].append({
+                'id': note['id'],
+                'content': note['content'],
+                'category': note['category'] or '普通',
+                'tags': note['tags'].split(',') if note['tags'] else [],
+                'template_name': note['template_name'],
+                'created_at': note['created_at'],
+                'updated_at': note['updated_at']
+            })
+        
+        return json.dumps(report, ensure_ascii=False, indent=2)
+    
+    elif fmt == 'markdown':
         lines = []
         lines.append(f"# 统计报告 - {range_label}")
         lines.append("")
@@ -356,7 +444,7 @@ def add_date_range_options(f):
 def add_export_options(f):
     """添加导出选项的装饰器"""
     f = click.option('--export', 'export_fmt',
-                     type=click.Choice(['txt', 'markdown']),
+                     type=click.Choice(['txt', 'markdown', 'json']),
                      help='导出报告格式')(f)
     f = click.option('-o', '--output', help='导出文件名（可选）')(f)
     return f
@@ -382,12 +470,13 @@ def overview(range_type, start, end, export_fmt, output):
     if (time_stats['total_tasks'] == 0 and 
         time_stats['total_pomodoros'] == 0 and 
         len(time_stats['notes']) == 0):
-        console.print(Panel(
-            f"[dim]{range_label}没有统计数据[/dim]\n\n"
-            "开始使用 eff 添加任务和番茄钟后，这里会显示统计信息",
-            title=f"📊 {range_label}统计概览", border_style="dim"
-        ))
-        return
+        if not export_fmt:
+            console.print(Panel(
+                f"[dim]{range_label}没有统计数据[/dim]\n\n"
+                "开始使用 eff 添加任务和番茄钟后，这里会显示统计信息",
+                title=f"📊 {range_label}统计概览", border_style="dim"
+            ))
+            return
     
     console.print(Panel.fit(
         f"[bold]📊 {range_label}统计概览[/bold]\n\n"

@@ -94,9 +94,15 @@ def init_db():
         keyword TEXT NOT NULL,
         search_type TEXT NOT NULL,
         hit_count INTEGER DEFAULT 0,
+        filters TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     ''')
+    
+    try:
+        cursor.execute('ALTER TABLE search_history ADD COLUMN filters TEXT')
+    except sqlite3.OperationalError:
+        pass
     
     cursor.execute('''
     CREATE INDEX IF NOT EXISTS idx_search_history_keyword ON search_history(keyword)

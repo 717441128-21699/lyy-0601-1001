@@ -1,17 +1,20 @@
+import json
 from datetime import datetime, date, timedelta
 from collections import defaultdict
 from .database import get_connection
 
 
-def record_search(keyword, search_type, hit_count):
+def record_search(keyword, search_type, hit_count, filters=None):
     """记录一次搜索"""
     conn = get_connection()
     cursor = conn.cursor()
     
+    filters_json = json.dumps(filters, ensure_ascii=False) if filters else None
+    
     cursor.execute('''
-    INSERT INTO search_history (keyword, search_type, hit_count)
-    VALUES (?, ?, ?)
-    ''', (keyword, search_type, hit_count))
+    INSERT INTO search_history (keyword, search_type, hit_count, filters)
+    VALUES (?, ?, ?, ?)
+    ''', (keyword, search_type, hit_count, filters_json))
     
     conn.commit()
     conn.close()
@@ -87,7 +90,14 @@ def get_search_history(search_type=None, sort_by='recent', keyword_filter=None, 
     rows = cursor.fetchall()
     conn.close()
     
-    return rows
+    result = []
+    for row in rows:
+        row_dict = dict(row)
+        if 'filters' in row_dict:
+            row_dict['filters'] = parse_filters(row_dict.get('filters'))
+        result.append(row_dict)
+    
+    return result
 
 
 def get_popular_keywords(search_type=None, limit=10):
@@ -119,6 +129,16 @@ def get_popular_keywords(search_type=None, limit=10):
     return rows
 
 
+def parse_filters(filters_str):
+    """解析 filters JSON 字符串"""
+    if not filters_str:
+        return {}
+    try:
+        return json.loads(filters_str)
+    except:
+        return {}
+
+
 def get_search_by_id(search_id):
     """根据ID获取搜索记录"""
     conn = get_connection()
@@ -127,6 +147,37 @@ def get_search_by_id(search_id):
     cursor.execute('SELECT * FROM search_history WHERE id = ?', (search_id,))
     row = cursor.fetchone()
     conn.close()
+    
+    if row:
+        row_dict = dict(row)
+        row_dict['filters'] = parse_filters(row_dict.get('filters'))
+        return row_dict
+    
+    return row
+
+
+def get_last_search(search_type=None):
+    """获取最近一次搜索"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    query = 'SELECT * FROM search_history'
+    params = []
+    
+    if search_type:
+        query += ' WHERE search_type = ?'
+        params.append(search_type)
+    
+    query += ' ORDER BY created_at DESC LIMIT 1'
+    
+    cursor.execute(query, params)
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        row_dict = dict(row)
+        row_dict['filters'] = parse_filters(row_dict.get('filters'))
+        return row_dict
     
     return row
 

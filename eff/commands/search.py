@@ -15,71 +15,103 @@ from ..utils import format_datetime
 console = Console()
 
 
-def _execute_task_search(keyword):
-    """执行任务搜索"""
-    conn = get_connection()
-    cursor = conn.cursor()
+def _execute_task_search(keyword, filters=None):
+    """执行任务搜索（支持筛选条件）"""
+    from .task import _execute_task_search as do_task_search
+    from ..utils import parse_date, format_date, get_status_label
     
-    cursor.execute('''
-    SELECT t.*,
-           (SELECT COUNT(*) FROM tasks WHERE parent_id = t.id) as subtask_count
-    FROM tasks t
-    WHERE t.title LIKE ? OR t.description LIKE ? OR t.tags LIKE ?
-    ORDER BY t.priority DESC, t.created_at DESC
-    ''', (f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'))
+    filters = filters or {}
     
-    tasks = cursor.fetchall()
-    conn.close()
+    tag = filters.get('tag')
+    status = filters.get('status')
+    start_date = parse_date(filters['start_date']) if filters.get('start_date') else None
+    end_date = parse_date(filters['end_date']) if filters.get('end_date') else None
     
-    record_search(keyword, 'task', len(tasks))
+    tasks, _ = do_task_search(keyword, tag, status, start_date, end_date)
+    
+    filter_desc = []
+    if keyword: filter_desc.append(f"关键词: {keyword}")
+    if tag: filter_desc.append(f"标签: {tag}")
+    if status: filter_desc.append(f"状态: {get_status_label(status)}")
+    if start_date: filter_desc.append(f"开始: {format_date(start_date)}")
+    if end_date: filter_desc.append(f"结束: {format_date(end_date)}")
     
     if not tasks:
+        desc = ", ".join(filter_desc) if filter_desc else "无筛选条件"
         console.print(Panel(
-            f"[dim]没有找到包含 '{keyword}' 的任务[/dim]\n\n"
+            f"[dim]没有找到匹配的任务[/dim]\n\n"
+            f"筛选条件: {desc}\n"
             "试试其他关键词，或使用 [cyan]eff task list[/cyan] 查看所有任务",
-            title="🔍 任务搜索结果", border_style="dim"
+            title="🔍 搜索结果", border_style="dim"
         ))
     else:
-        console.print(f"[dim]找到 {len(tasks)} 个匹配的任务[/dim]")
         from .task import display_tasks
+        desc = ", ".join(filter_desc) if filter_desc else "全部任务"
+        console.print(f"[dim]找到 {len(tasks)} 个匹配的任务 ({desc})[/dim]")
         display_tasks(tasks)
 
 
-def _execute_note_search(keyword):
-    """执行笔记搜索"""
-    from .note import search_notes
+def _execute_note_search(keyword, filters=None):
+    """执行笔记搜索（支持筛选条件）"""
+    from .note import _execute_note_search as do_note_search
+    from ..utils import parse_date, format_date
     
-    notes = search_notes(keyword)
-    record_search(keyword, 'note', len(notes))
+    filters = filters or {}
+    
+    tag = filters.get('tag')
+    category = filters.get('category')
+    start_date = parse_date(filters['start_date']) if filters.get('start_date') else None
+    end_date = parse_date(filters['end_date']) if filters.get('end_date') else None
+    
+    notes, _ = do_note_search(keyword, tag, category, start_date, end_date)
+    
+    filter_desc = []
+    if keyword: filter_desc.append(f"关键词: {keyword}")
+    if tag: filter_desc.append(f"标签: {tag}")
+    if category: filter_desc.append(f"分类: {category}")
+    if start_date: filter_desc.append(f"开始: {format_date(start_date)}")
+    if end_date: filter_desc.append(f"结束: {format_date(end_date)}")
     
     if not notes:
+        desc = ", ".join(filter_desc) if filter_desc else "无筛选条件"
         console.print(Panel(
-            f"[dim]没有找到包含 '{keyword}' 的笔记[/dim]\n\n"
+            f"[dim]没有找到匹配的笔记[/dim]\n\n"
+            f"筛选条件: {desc}\n"
             "试试其他关键词，或使用 [cyan]eff note list[/cyan] 查看所有笔记",
-            title="🔍 笔记搜索结果", border_style="dim"
+            title="🔍 搜索结果", border_style="dim"
         ))
     else:
-        console.print(f"[dim]找到 {len(notes)} 条匹配的笔记[/dim]")
         from .note import _display_search_results
+        desc = ", ".join(filter_desc) if filter_desc else "全部笔记"
+        console.print(f"[dim]找到 {len(notes)} 条匹配的笔记 ({desc})[/dim]")
         _display_search_results(notes)
 
 
 def run_search(record):
-    """根据搜索记录执行搜索"""
+    """根据搜索记录执行搜索（带筛选条件）"""
     if not record:
         console.print("[red]✗ 没有找到搜索记录[/red]")
         return
     
     keyword = record['keyword']
     search_type = record['search_type']
+    filters = record.get('filters', {})
     type_label = {'task': '任务', 'note': '笔记'}[search_type]
     
-    console.print(f"\n[cyan]正在重新搜索 {type_label}: {keyword}[/cyan]\n")
+    filter_parts = []
+    if filters:
+        for k, v in filters.items():
+            k_label = {'tag': '标签', 'status': '状态', 'category': '分类', 'start_date': '开始', 'end_date': '结束'}[k]
+            filter_parts.append(f"{k_label}: {v}")
+    
+    filter_str = f" (筛选: {', '.join(filter_parts)})" if filter_parts else ""
+    
+    console.print(f"\n[cyan]正在重新搜索 {type_label}: {keyword or '无'}{filter_str}[/cyan]\n")
     
     if search_type == 'task':
-        _execute_task_search(keyword)
+        _execute_task_search(keyword, filters)
     elif search_type == 'note':
-        _execute_note_search(keyword)
+        _execute_note_search(keyword, filters)
 
 
 @click.group()
@@ -140,19 +172,30 @@ def history(search_type, sort_by, keyword, limit, run_id):
                 format_datetime(datetime.fromisoformat(r['last_searched']))
             )
     else:
-        table.add_column("ID", style="dim", width=6)
+        table.add_column("编号", style="dim", width=6)
+        table.add_column("类型", width=6)
         table.add_column("关键词", overflow="fold")
-        table.add_column("类型", width=8)
-        table.add_column("命中数", width=8)
+        table.add_column("命中", width=6)
+        table.add_column("筛选条件", overflow="fold")
         table.add_column("搜索时间", width=20)
         
-        for r in records:
+        id_map = {}
+        for idx, r in enumerate(records, 1):
+            id_map[idx] = r['id']
             type_label = {'task': '任务', 'note': '笔记'}.get(r['search_type'], r['search_type'])
+            filters = r.get('filters', {})
+            filter_strs = []
+            if filters:
+                for k, v in filters.items():
+                    k_short = {'tag': '标签', 'status': '状态', 'category': '分类', 'start_date': '开始', 'end_date': '结束'}[k]
+                    filter_strs.append(f"{k_short}:{v}")
+            filter_display = ", ".join(filter_strs) if filter_strs else "-"
             table.add_row(
-                str(r['id']),
-                r['keyword'],
+                str(idx),
                 type_label,
+                r['keyword'] or "(无关键词)",
                 str(r['hit_count']),
+                filter_display,
                 format_datetime(datetime.fromisoformat(r['created_at']))
             )
     
@@ -162,8 +205,23 @@ def history(search_type, sort_by, keyword, limit, run_id):
     console.print(f"[bold]🔍 {type_label}{sort_label}历史[/bold]\n")
     console.print(table)
     
-    if sort_by == 'recent':
-        console.print(f"\n[dim]💡 使用 [cyan]eff search history -r <ID>[/cyan] 直接复用搜索[/dim]")
+    if sort_by == 'recent' and records:
+        console.print(f"\n[dim]💡 输入编号直接复用搜索，或按回车退出[/dim]")
+        try:
+            choice = click.prompt("", prompt_suffix="> ", default="", show_default=False)
+            if choice.strip():
+                try:
+                    idx = int(choice.strip())
+                    if idx in id_map:
+                        record = get_search_by_id(id_map[idx])
+                        if record:
+                            run_search(record)
+                    else:
+                        console.print(f"[yellow]⚠ 编号 {idx} 不在范围内[/yellow]")
+                except ValueError:
+                    console.print(f"[yellow]⚠ 请输入有效的编号[/yellow]")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 @search.command()

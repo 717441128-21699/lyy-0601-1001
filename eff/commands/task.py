@@ -344,41 +344,94 @@ def split(task_id, subtasks):
         console.print(f"[red]✗ 父任务不存在[/red]")
 
 
-@task.command()
-@click.argument('keyword')
-def search(keyword):
-    """搜索任务"""
+def _execute_task_search(keyword, tag=None, status=None, start_date=None, end_date=None):
+    """执行任务搜索（可复用）"""
     conn = get_connection()
     cursor = conn.cursor()
     
-    cursor.execute('''
+    query = '''
     SELECT t.*,
            (SELECT COUNT(*) FROM tasks WHERE parent_id = t.id) as subtask_count
     FROM tasks t
-    WHERE t.title LIKE ? OR t.description LIKE ? OR t.tags LIKE ?
-    ORDER BY t.priority DESC, t.created_at DESC
-    ''', (f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'))
+    WHERE 1=1
+    '''
+    params = []
     
+    if keyword:
+        query += ' AND (t.title LIKE ? OR t.description LIKE ? OR t.tags LIKE ?)'
+        params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
+    
+    if tag:
+        query += ' AND t.tags LIKE ?'
+        params.append(f'%{tag}%')
+    
+    if status:
+        query += ' AND t.status = ?'
+        params.append(status)
+    
+    if start_date:
+        query += ' AND DATE(t.created_at) >= ?'
+        params.append(start_date.isoformat())
+    
+    if end_date:
+        query += ' AND DATE(t.created_at) <= ?'
+        params.append(end_date.isoformat())
+    
+    query += ' ORDER BY t.priority DESC, t.created_at DESC'
+    
+    cursor.execute(query, params)
     tasks = cursor.fetchall()
     conn.close()
     
-    record_search(keyword, 'task', len(tasks))
+    filters = {}
+    if tag: filters['tag'] = tag
+    if status: filters['status'] = status
+    if start_date: filters['start_date'] = start_date.isoformat()
+    if end_date: filters['end_date'] = end_date.isoformat()
+    
+    record_search(keyword or '', 'task', len(tasks), filters if filters else None)
+    
+    return tasks, filters
+
+
+@task.command()
+@click.argument('keyword', required=False)
+@click.option('-t', '--tag', help='按标签筛选')
+@click.option('-s', '--status', type=click.Choice(['pending', 'in_progress', 'completed', 'cancelled']), help='按状态筛选')
+@click.option('--start', help='开始日期 (YYYY-MM-DD)')
+@click.option('--end', help='结束日期 (YYYY-MM-DD)')
+def search(keyword, tag, status, start, end):
+    """搜索任务（支持标签、状态、日期范围筛选）"""
+    start_date = parse_date(start) if start else None
+    end_date = parse_date(end) if end else None
+    
+    tasks, filters = _execute_task_search(keyword, tag, status, start_date, end_date)
+    
+    filter_desc = []
+    if keyword: filter_desc.append(f"关键词: {keyword}")
+    if tag: filter_desc.append(f"标签: {tag}")
+    if status: filter_desc.append(f"状态: {get_status_label(status)}")
+    if start_date: filter_desc.append(f"开始: {format_date(start_date)}")
+    if end_date: filter_desc.append(f"结束: {format_date(end_date)}")
     
     if not tasks:
+        desc = ", ".join(filter_desc) if filter_desc else "无筛选条件"
         console.print(Panel(
-            f"[dim]没有找到包含 '{keyword}' 的任务[/dim]\n\n"
+            f"[dim]没有找到匹配的任务[/dim]\n\n"
+            f"筛选条件: {desc}\n"
             "试试其他关键词，或使用 [cyan]eff task list[/cyan] 查看所有任务",
             title="🔍 搜索结果", border_style="dim"
         ))
     else:
-        console.print(f"[dim]找到 {len(tasks)} 个匹配的任务[/dim]")
+        desc = ", ".join(filter_desc) if filter_desc else "全部任务"
+        console.print(f"[dim]找到 {len(tasks)} 个匹配的任务 ({desc})[/dim]")
         display_tasks(tasks)
 
 
 @task.command()
 @click.option('-r', '--run', is_flag=True, help='直接运行上次搜索')
 def last(run):
-    """查看或复用上次搜索"""
+    """查看或复用上次搜索（带筛选条件）"""
     last = get_last_search('task')
     
     if not last:
@@ -392,16 +445,48 @@ def last(run):
     keyword = last['keyword']
     hit_count = last['hit_count']
     searched_at = datetime.fromisoformat(last['created_at'])
+    filters = last.get('filters', {})
     
     console.print(f"[bold]🔍 上次任务搜索[/bold]\n")
-    console.print(f"  关键词: [cyan]{keyword}[/cyan]")
+    console.print(f"  关键词: [cyan]{keyword or '无'}[/cyan]")
     console.print(f"  命中数: {hit_count}")
     console.print(f"  搜索时间: {format_datetime(searched_at)}")
     
+    if filters:
+        console.print(f"\n[bold]  筛选条件:[/bold]")
+        if filters.get('tag'): console.print(f"    标签: {filters['tag']}")
+        if filters.get('status'): console.print(f"    状态: {get_status_label(filters['status'])}")
+        if filters.get('start_date'): console.print(f"    开始日期: {filters['start_date']}")
+        if filters.get('end_date'): console.print(f"    结束日期: {filters['end_date']}")
+    
     if run:
-        console.print(f"\n[cyan]正在重新搜索...[/cyan]\n")
-        ctx = click.get_current_context()
-        ctx.invoke(search, keyword=keyword)
+        console.print(f"\n[cyan]正在重新搜索（带筛选条件）...[/cyan]\n")
+        from ..utils import parse_date
+        tag = filters.get('tag')
+        status = filters.get('status')
+        start_date = parse_date(filters['start_date']) if filters.get('start_date') else None
+        end_date = parse_date(filters['end_date']) if filters.get('end_date') else None
+        
+        tasks, _ = _execute_task_search(keyword, tag, status, start_date, end_date)
+        
+        filter_desc = []
+        if keyword: filter_desc.append(f"关键词: {keyword}")
+        if tag: filter_desc.append(f"标签: {tag}")
+        if status: filter_desc.append(f"状态: {get_status_label(status)}")
+        if start_date: filter_desc.append(f"开始: {format_date(start_date)}")
+        if end_date: filter_desc.append(f"结束: {format_date(end_date)}")
+        
+        if not tasks:
+            desc = ", ".join(filter_desc) if filter_desc else "无筛选条件"
+            console.print(Panel(
+                f"[dim]没有找到匹配的任务[/dim]\n\n"
+                f"筛选条件: {desc}",
+                title="🔍 搜索结果", border_style="dim"
+            ))
+        else:
+            desc = ", ".join(filter_desc) if filter_desc else "全部任务"
+            console.print(f"[dim]找到 {len(tasks)} 个匹配的任务 ({desc})[/dim]")
+            display_tasks(tasks)
 
 
 @task.command()

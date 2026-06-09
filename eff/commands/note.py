@@ -56,20 +56,56 @@ def list_notes(category=None, tag=None, limit=50):
     return rows
 
 
-def search_notes(keyword):
+def search_notes(keyword, tag=None, category=None, start_date=None, end_date=None):
+    """搜索笔记（支持高级筛选）"""
     conn = get_connection()
     cursor = conn.cursor()
     
-    cursor.execute('''
-    SELECT * FROM notes 
-    WHERE content LIKE ? OR category LIKE ? OR tags LIKE ?
-    ORDER BY created_at DESC
-    ''', (f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'))
+    query = 'SELECT * FROM notes WHERE 1=1'
+    params = []
     
+    if keyword:
+        query += ' AND (content LIKE ? OR category LIKE ? OR tags LIKE ?)'
+        params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
+    
+    if tag:
+        query += ' AND tags LIKE ?'
+        params.append(f'%{tag}%')
+    
+    if category:
+        query += ' AND category = ?'
+        params.append(category)
+    
+    if start_date:
+        query += ' AND DATE(created_at) >= ?'
+        params.append(start_date.isoformat())
+    
+    if end_date:
+        query += ' AND DATE(created_at) <= ?'
+        params.append(end_date.isoformat())
+    
+    query += ' ORDER BY created_at DESC'
+    
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
     
     return rows
+
+
+def _execute_note_search(keyword, tag=None, category=None, start_date=None, end_date=None):
+    """执行笔记搜索（可复用，记录搜索历史）"""
+    notes = search_notes(keyword, tag, category, start_date, end_date)
+    
+    filters = {}
+    if tag: filters['tag'] = tag
+    if category: filters['category'] = category
+    if start_date: filters['start_date'] = start_date.isoformat()
+    if end_date: filters['end_date'] = end_date.isoformat()
+    
+    record_search(keyword or '', 'note', len(notes), filters if filters else None)
+    
+    return notes, filters
 
 
 def delete_note(note_id):
@@ -209,28 +245,45 @@ def list_cmd(category, tag, limit):
 
 
 @note.command()
-@click.argument('keyword')
-def search(keyword):
-    """搜索笔记"""
-    notes = search_notes(keyword)
+@click.argument('keyword', required=False)
+@click.option('-t', '--tag', help='按标签筛选')
+@click.option('-c', '--category', help='按分类筛选')
+@click.option('--start', help='开始日期 (YYYY-MM-DD)')
+@click.option('--end', help='结束日期 (YYYY-MM-DD)')
+def search(keyword, tag, category, start, end):
+    """搜索笔记（支持标签、分类、日期范围筛选）"""
+    from ..utils import parse_date, format_date
     
-    record_search(keyword, 'note', len(notes))
+    start_date = parse_date(start) if start else None
+    end_date = parse_date(end) if end else None
+    
+    notes, filters = _execute_note_search(keyword, tag, category, start_date, end_date)
+    
+    filter_desc = []
+    if keyword: filter_desc.append(f"关键词: {keyword}")
+    if tag: filter_desc.append(f"标签: {tag}")
+    if category: filter_desc.append(f"分类: {category}")
+    if start_date: filter_desc.append(f"开始: {format_date(start_date)}")
+    if end_date: filter_desc.append(f"结束: {format_date(end_date)}")
     
     if not notes:
+        desc = ", ".join(filter_desc) if filter_desc else "无筛选条件"
         console.print(Panel(
-            f"[dim]没有找到包含 '{keyword}' 的笔记[/dim]\n\n"
+            f"[dim]没有找到匹配的笔记[/dim]\n\n"
+            f"筛选条件: {desc}\n"
             "试试其他关键词，或使用 [cyan]eff note list[/cyan] 查看所有笔记",
             title="🔍 搜索结果", border_style="dim"
         ))
     else:
-        console.print(f"[dim]找到 {len(notes)} 个匹配的笔记[/dim]")
-        display_notes(notes)
+        desc = ", ".join(filter_desc) if filter_desc else "全部笔记"
+        console.print(f"[dim]找到 {len(notes)} 条匹配的笔记 ({desc})[/dim]")
+        _display_search_results(notes)
 
 
 @note.command()
 @click.option('-r', '--run', is_flag=True, help='直接运行上次搜索')
 def last(run):
-    """查看或复用上次搜索"""
+    """查看或复用上次搜索（带筛选条件）"""
     last = get_last_search('note')
     
     if not last:
@@ -244,16 +297,48 @@ def last(run):
     keyword = last['keyword']
     hit_count = last['hit_count']
     searched_at = datetime.fromisoformat(last['created_at'])
+    filters = last.get('filters', {})
     
     console.print(f"[bold]🔍 上次笔记搜索[/bold]\n")
-    console.print(f"  关键词: [cyan]{keyword}[/cyan]")
+    console.print(f"  关键词: [cyan]{keyword or '无'}[/cyan]")
     console.print(f"  命中数: {hit_count}")
     console.print(f"  搜索时间: {format_datetime(searched_at)}")
     
+    if filters:
+        console.print(f"\n[bold]  筛选条件:[/bold]")
+        if filters.get('tag'): console.print(f"    标签: {filters['tag']}")
+        if filters.get('category'): console.print(f"    分类: {filters['category']}")
+        if filters.get('start_date'): console.print(f"    开始日期: {filters['start_date']}")
+        if filters.get('end_date'): console.print(f"    结束日期: {filters['end_date']}")
+    
     if run:
-        console.print(f"\n[cyan]正在重新搜索...[/cyan]\n")
-        ctx = click.get_current_context()
-        ctx.invoke(search, keyword=keyword)
+        console.print(f"\n[cyan]正在重新搜索（带筛选条件）...[/cyan]\n")
+        from ..utils import parse_date, format_date
+        tag = filters.get('tag')
+        category = filters.get('category')
+        start_date = parse_date(filters['start_date']) if filters.get('start_date') else None
+        end_date = parse_date(filters['end_date']) if filters.get('end_date') else None
+        
+        notes, _ = _execute_note_search(keyword, tag, category, start_date, end_date)
+        
+        filter_desc = []
+        if keyword: filter_desc.append(f"关键词: {keyword}")
+        if tag: filter_desc.append(f"标签: {tag}")
+        if category: filter_desc.append(f"分类: {category}")
+        if start_date: filter_desc.append(f"开始: {format_date(start_date)}")
+        if end_date: filter_desc.append(f"结束: {format_date(end_date)}")
+        
+        if not notes:
+            desc = ", ".join(filter_desc) if filter_desc else "无筛选条件"
+            console.print(Panel(
+                f"[dim]没有找到匹配的笔记[/dim]\n\n"
+                f"筛选条件: {desc}",
+                title="🔍 搜索结果", border_style="dim"
+            ))
+        else:
+            desc = ", ".join(filter_desc) if filter_desc else "全部笔记"
+            console.print(f"[dim]找到 {len(notes)} 条匹配的笔记 ({desc})[/dim]")
+            _display_search_results(notes)
 
 
 @note.command()
